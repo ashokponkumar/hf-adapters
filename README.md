@@ -270,3 +270,5 @@ pre-commit run --all-files
 ## License
 
 Apache 2.0
+
+<!-- Test-With trial companion (throwaway, do not merge) -->
