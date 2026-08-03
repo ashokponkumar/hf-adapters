@@ -32,12 +32,19 @@ this file is plain pytest.
 """
 
 import gc
+import sys
 
 import pytest
 import torch
-from conftest import load_hf_causal_lm, torch_dtype_for
-from model_registry import CAUSAL_LM_MODELS as MODELS
 from transformers import AutoTokenizer
+
+from tests.conftest import (
+    get_dtype_for_cpu,
+    load_ref_model,
+    resolve_adapter_module_for_test,
+)
+from tests.cpu.conftest import _unwrap_compiled_blocks
+from tests.model_registry import CAUSAL_PATHS
 
 PROMPT = "The capital of France is"
 NUM_DECODE = 4
@@ -155,60 +162,17 @@ def adapter_greedy_steps(run_forward_fn, model, input_ids, num_decode=NUM_DECODE
     return results
 
 
-@pytest.mark.parametrize("model_key", list(MODELS.keys()), ids=list(MODELS.keys()))
-def test_manual_path(model_key, load_adapter, unwrap_compiled_blocks, set_rope_dtype):
-    info = MODELS[model_key]
-    adapter_mod = load_adapter(info["adapter"])
-    torch_dtype = torch_dtype_for(info)
-
-    tokenizer_path = info.get("tokenizer_path", info["path"])
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    input_ids = tokenizer(PROMPT, return_tensors="pt")["input_ids"]
-
-    # Phase 1: HF reference
-    model = load_hf_causal_lm(info, torch_dtype, adapter_mod=adapter_mod)
-    model.eval()
-    model.requires_grad_(False)
-    hf_results = hf_greedy_steps(model, input_ids, num_decode=NUM_DECODE)
-    del model
-    gc.collect()
-
-    # Phase 2: adapter (fresh load — prepare_for_spyre is destructive)
-    model = load_hf_causal_lm(info, torch_dtype, adapter_mod=adapter_mod)
-    model.eval()
-    model.requires_grad_(False)
-    adapter_mod.prepare_for_spyre(model)
-    # Manual path skips load_model_common; propagate the chosen dtype to the
-    # RoPE freq cache like the production move does (needed for bf16 models).
-    set_rope_dtype(model, torch_dtype)
-    unwrap_compiled_blocks(model)
-    adapter_results = adapter_greedy_steps(
-        adapter_mod._run_forward, model, input_ids, num_decode=NUM_DECODE
-    )
-    del model
-    gc.collect()
-
-    for hf_r, ad_r in zip(hf_results, adapter_results):
-        step_label = "prefill" if hf_r["step"] == 0 else f"decode-{hf_r['step']}"
-        assert hf_r["token"] == ad_r["token"], (
-            f"{step_label}: HF token {hf_r['token']!r} "
-            f"({tokenizer.decode([hf_r['token']])!r}) != "
-            f"adapter token {ad_r['token']!r} "
-            f"({tokenizer.decode([ad_r['token']])!r})"
-        )
-
-
-@pytest.mark.parametrize("model_key", list(MODELS.keys()), ids=list(MODELS.keys()))
-def test_auto_loader(model_key, auto_spyre_model, unwrap_compiled_blocks, load_adapter):
-    info = MODELS[model_key]
-    torch_dtype = torch_dtype_for(info)
-    tokenizer = AutoTokenizer.from_pretrained(info["path"])
+@pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
+def test_auto_loader(model_path):
+    auto_spyre_model = sys.modules["hf_adapters.auto_spyre_model"]
+    torch_dtype = get_dtype_for_cpu(model_path=model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
 
     # Phase 1: auto-loader generate
     model = auto_spyre_model.AutoSpyreModelForCausalLM.from_pretrained(
-        info["path"], dtype=torch_dtype
+        model_path, dtype=torch_dtype
     )
-    unwrap_compiled_blocks(model)
+    _unwrap_compiled_blocks(model)
     auto_outputs = model.generate(
         tokenizer, [PROMPT], max_new_tokens=NUM_DECODE, do_sample=False
     )
@@ -216,10 +180,8 @@ def test_auto_loader(model_key, auto_spyre_model, unwrap_compiled_blocks, load_a
     gc.collect()
 
     # Phase 2: HF reference (fresh)
-    adapter_mod = load_adapter(info["adapter"]) if info.get("load_fn") else None
-    hf_model = load_hf_causal_lm(info, torch_dtype, adapter_mod=adapter_mod)
-    hf_model.eval()
-    hf_model.requires_grad_(False)
+    adapter_mod = resolve_adapter_module_for_test(model_path)
+    hf_model = load_ref_model(model_path, adapter_mod)
     encoded = tokenizer(PROMPT, return_tensors="pt")
     with torch.no_grad():
         hf_out = hf_model.generate(

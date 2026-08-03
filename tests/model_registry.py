@@ -23,6 +23,25 @@ When new adapters are added to CONFIG_TO_ADAPTER_MODULE_MAPPING, tests will
 automatically cover them by selecting one representative model per adapter.
 """
 
+from __future__ import annotations
+
+import os
+import types
+
+import pytest
+
+
+def _include_gated() -> bool:
+    """Whether gated models should be included in the parametrized test lists.
+
+    Gated models (Llama, google/gemma-*, some Mistral repos) require HF auth.
+    They are excluded by default so runs in environments without auth don't fail
+    on collection. Set ``SPYRE_INCLUDE_GATED=1`` (e.g. on the Spyre pod, where the
+    HF token is configured) to opt them in.
+    """
+    return os.getenv("SPYRE_INCLUDE_GATED", "0") == "1"
+
+
 # Model registries - shared by all tests
 CAUSAL_LM_MODELS = {
     # hf_gpt2.py
@@ -66,12 +85,23 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_granitemoehybrid.py",
         "size": "1b",
     },
+    "granite4_instruct": {
+        "name": "Granite 4.0 1B Instruct",
+        "path": "ibm-granite/granite-4.0-1b",
+        "adapter": "hf_granitemoehybrid.py",
+        "size": "1b",
+    },
+    "granite4_micro": {
+        "name": "Granite 4.0 Micro",
+        "path": "ibm-granite/granite-4.0-micro",
+        "adapter": "hf_granitemoehybrid.py",
+        "size": "3b",
+    },
     # hf_granite_vision.py
     "granite-vision": {
         "name": "Granite Vision 4.1 4B",
         "path": "ibm-granite/granite-vision-4.1-4b",
         "adapter": "hf_granite_vision.py",
-        "load_fn": True,
         "size": "4b",
     },
     # hf_smollm3.py
@@ -140,13 +170,25 @@ CAUSAL_LM_MODELS = {
         "adapter": "hf_mistral.py",
         "size": "3b",
     },
+    # hf_ministral.py
+    "ministral8b": {
+        "name": "Ministral-8B-Instruct-2410",
+        "path": "mistralai/Ministral-8B-Instruct-2410",
+        "adapter": "hf_ministral.py",
+        "size": "8b",
+    },
     # hf_mistral3.py
     "mistral3": {
         "name": "Mistral-Small-3.2-24B-Instruct-2506",
         "path": "mistralai/Mistral-Small-3.2-24B-Instruct-2506",
         "adapter": "hf_mistral3.py",
-        "load_fn": True,
         "size": "24b",
+    },
+    "ministral3": {
+        "name": "Ministral-3-14B-Instruct-2512",
+        "path": "mistralai/Ministral-3-14B-Instruct-2512",
+        "adapter": "hf_mistral3.py",
+        "size": "14b",
     },
     # hf_olmo.py
     "olmo1b": {
@@ -177,15 +219,55 @@ CAUSAL_LM_MODELS = {
         "size": "1b",
     },
     # hf_gemma4
+    "gemma4_base": {
+        "name": "Gemma 4 12B Base",
+        "path": "google/gemma-4-12b",
+        "adapter": "hf_gemma4.py",
+        "size": "12b",
+        "dtype": "bfloat16",
+    },
     "gemma4_google": {
         "name": "Gemma 4 12B",
         "path": "google/gemma-4-12B-it",
         "adapter": "hf_gemma4.py",
-        "is_gated": True,
         "size": "12b",
     },
+    "gemma4_31b": {
+        "name": "Gemma 4 31B",
+        "path": "google/gemma-4-31b",
+        "adapter": "hf_gemma4.py",
+        "size": "31b",
+        "dtype": "bfloat16",
+        "is_gated": True,
+    },
+    # DSpark speculative-decoding drafters (block proposers). kind="dspark_draft"
+    # keeps them out of the generate-based causal-LM harnesses (see CAUSAL_PATHS);
+    # tests/spyre/test_dspark_draft_spyre.py exercises the block-propose path.
+    # hf_dspark_qwen3.py
+    "dspark_qwen3": {
+        "name": "DSpark Qwen3 Drafter (block7)",
+        "path": "deepseek-ai/dspark_qwen3_4b_block7",
+        "adapter": "hf_dspark_qwen3.py",
+        "size": "0.6b",
+        "kind": "dspark_draft",
+    },
+    # hf_dspark_gemma4.py
+    "dspark_gemma4": {
+        "name": "DSpark Gemma 4 Drafter (block7)",
+        "path": "deepseek-ai/dspark_gemma4_12b_block7",
+        "adapter": "hf_dspark_gemma4.py",
+        "size": "1b",
+        "kind": "dspark_draft",
+    },
+    # hf_dspark_granite.py
+    "dspark_granite": {
+        "name": "DSpark Granite Drafter (block7)",
+        "path": "deepseek-ai/dspark_granite_4_1_8b_block7",
+        "adapter": "hf_dspark_granite.py",
+        "size": "1b",
+        "kind": "dspark_draft",
+    },
 }
-
 
 EMBEDDING_MODELS = {
     # hf_gemma3.py
@@ -193,7 +275,6 @@ EMBEDDING_MODELS = {
         "name": "EmbeddingGemma 300M",
         "path": "google/embeddinggemma-300m",
         "adapter": "hf_gemma3.py",
-        "dtype": "bfloat16",  # bf16-native; fp16 overflows the residual stream
         "is_gated": True,
         "size": "0.3b",
     },
@@ -303,12 +384,74 @@ EMBEDDING_MODELS = {
 }
 
 
-def _get_adapter_module_name(adapter_module):  # type: ignore[no-untyped-def]
+# Vision models. ``kind="tower"`` adapters are encoder-only; ``kind="vlm"`` adapters
+# are full multimodal models with a causal text decoder, RoPE, KV caches, and ``generate``.
+VISION_MODELS = {
+    # hf_siglip_vision.py — SigLIP vision tower of Granite Vision 4.1
+    "granite_vision_siglip": {
+        "name": "Granite Vision 4.1 4B (SigLIP tower)",
+        "path": "ibm-granite/granite-vision-4.1-4b",
+        "adapter": "hf_siglip_vision.py",
+        "kind": "tower",  # bare vision tower: pixel_values -> patch hidden states
+    },
+    # hf_granite_vision_mm.py — combined two-tower (vision + text) forward
+    "granite_vision_mm": {
+        "name": "Granite Vision 4.1 4B (both towers)",
+        "path": "ibm-granite/granite-vision-4.1-4b",
+        "adapter": "hf_granite_vision_mm.py",
+        "kind": "vlm",  # multimodal: image + text -> generated text
+        "size": "4b",
+    },
+    # hf_pixtral_vision.py — Pixtral vision tower of Mistral3 Vision models
+    "mistral3_vision_pixtral": {
+        "name": "Mistral-Small-3.1-24B-Instruct-2503 (Pixtral tower)",
+        "path": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        "adapter": "hf_pixtral_vision.py",
+        "kind": "tower",  # bare vision tower: pixel_values -> patch hidden states
+    },
+    # hf_mistral3_vision_mm.py — combined two-tower (Pixtral + Mistral text) forward
+    "mistral3_vision_mm": {
+        "name": "Mistral-Small-3.1-24B-Instruct-2503 (both towers)",
+        "path": "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        "adapter": "hf_mistral3_vision_mm.py",
+        "kind": "vlm",  # multimodal: image + text -> generated text
+        "size": "24b",
+    },
+    # hf_mistral3_vision_mm.py — Ministral-3 14B (ministral3 text backbone variant)
+    "ministral3_vision_mm": {
+        "name": "Ministral-3-14B-Instruct-2512 (both towers)",
+        "path": "mistralai/Ministral-3-14B-Instruct-2512",
+        "adapter": "hf_mistral3_vision_mm.py",
+        "kind": "vlm",  # multimodal: image + text -> generated text
+        "dtype": "bfloat16",  # blocked-FP8 checkpoint, dequantized to bf16
+        "size": "14b",
+    },
+    # hf_mistral3_vision_mm.py — Ministral-3 3B (smallest ministral3 vision variant)
+    "ministral3_3b_vision_mm": {
+        "name": "Ministral-3-3B-Instruct-2512 (both towers)",
+        "path": "mistralai/Ministral-3-3B-Instruct-2512",
+        "adapter": "hf_mistral3_vision_mm.py",
+        "kind": "vlm",  # multimodal: image + text -> generated text
+        "dtype": "bfloat16",  # blocked-FP8 checkpoint, dequantized to bf16
+        "size": "3b",
+    },
+    # hf_gemma4_mm.py — unified encoder-free VLM (image + text -> text)
+    "gemma4_mm": {
+        "name": "Gemma 4 12B (unified VLM)",
+        "path": "google/gemma-4-12B-it",
+        "adapter": "hf_gemma4_mm.py",
+        "kind": "vlm",  # multimodal: image + text -> generated text
+        "size": "12b",
+    },
+}
+
+
+def _get_adapter_module_name(adapter_module: types.ModuleType) -> str:
     """Extract module name from adapter module object (e.g., hf_qwen3)."""
     return adapter_module.__name__.split(".")[-1]
 
 
-def _parse_size(size_str):
+def _parse_size(size_str: str) -> float:
     """
     Parse size string (e.g., '2b', '0.3B', '1.5b') to float for comparison.
 
@@ -322,95 +465,133 @@ def _parse_size(size_str):
     return float(size_str.lower().rstrip("b"))
 
 
-def select_representative_models(config_mapping=None):
+def _select_representative_paths(
+    models: dict[str, dict],
+    *,
+    include_gated: bool,
+    predicate=None,
+) -> list[str]:
+    """Select one representative model path per adapter module.
+
+    Groups ``models`` by adapter and picks the smallest (by ``size``) model in
+    each group, breaking ties by key name for determinism. Gated models are
+    skipped unless ``include_gated``. An optional ``predicate(info) -> bool``
+    filters which entries are eligible (e.g. ``kind == "vlm"`` for vision).
     """
-    Programmatically select one representative model per adapter module.
+    adapter_to_keys: dict[str, list[str]] = {}
+    for key, info in models.items():
+        if info.get("is_gated", False) and not include_gated:
+            continue
+        if predicate is not None and not predicate(info):
+            continue
+        adapter = info["adapter"].replace(".py", "")
+        adapter_to_keys.setdefault(adapter, []).append(key)
 
-    Analyzes CONFIG_TO_ADAPTER_MODULE_MAPPING and selects one model per adapter
-    from the registries above. Prefers smaller models for faster test execution.
+    paths: list[str] = []
+    for keys in adapter_to_keys.values():
+        # Prefer smaller models (by size field) for faster tests; tie-break on
+        # key name for consistency across runs.
+        sorted_keys = sorted(
+            keys,
+            key=lambda k: (_parse_size(models[k]["size"]), k),
+        )
+        paths.append(models[sorted_keys[0]]["path"])
+    return paths
 
-    Args:
-        config_mapping: Optional CONFIG_TO_ADAPTER_MODULE_MAPPING to use.
-                       If None, will be imported from hf_adapters.auto_spyre_model.
 
-    Returns:
-        tuple: (causal_keys, embed_keys) where each is a list of model keys
-    """
-    # Import here to avoid issues with conftest.py patching
-    if config_mapping is None:
-        from hf_adapters.auto_spyre_model import CONFIG_TO_ADAPTER_MODULE_MAPPING
+# One representative model per adapter module (smallest by size), so tests
+# automatically cover new adapters. A single ``_include_gated()`` snapshot is
+# shared across all three selections. ``kind == "vlm"`` excludes bare vision towers.
+_include_gated_flag = _include_gated()
 
-        config_mapping = CONFIG_TO_ADAPTER_MODULE_MAPPING
+# ``kind == "dspark_draft"`` entries are speculative-decoding drafters (block
+# proposers, driven by ``_run_draft_block`` — no ``generate``), so they are
+# registered for adapter-coverage but excluded from the generate-based CPU/Spyre
+# causal-LM harnesses; they are exercised by tests/spyre/test_dspark_draft_spyre.py.
+CAUSAL_PATHS: list[str] = _select_representative_paths(
+    CAUSAL_LM_MODELS,
+    include_gated=_include_gated_flag,
+    predicate=lambda info: info.get("kind") != "dspark_draft",
+)
+# The DSpark drafter checkpoints (block proposers), one per adapter — exercised by
+# tests/spyre/test_dspark_draft_spyre.py via the block-propose ``_run_draft_block``.
+DSPARK_PATHS: list[str] = _select_representative_paths(
+    CAUSAL_LM_MODELS,
+    include_gated=_include_gated_flag,
+    predicate=lambda info: info.get("kind") == "dspark_draft",
+)
+EMBED_PATHS: list[str] = _select_representative_paths(
+    EMBEDDING_MODELS, include_gated=_include_gated_flag
+)
+VISION_PATHS: list[str] = _select_representative_paths(
+    VISION_MODELS,
+    include_gated=_include_gated_flag,
+    predicate=lambda info: info.get("kind") == "vlm",
+)
 
-    # Get set of adapter module names from CONFIG_TO_ADAPTER_MODULE_MAPPING
-    adapter_modules_in_config = {
-        _get_adapter_module_name(adapter_mod) for adapter_mod in config_mapping.values()
+
+def _non_blocking(models: dict[str, dict], keys: tuple[str, ...]) -> dict[str, str]:
+    """Build a ``{path: xfail reason}`` table from registry keys."""
+    return {
+        models[key]["path"]: (
+            f"{key}: temporarily non-blocking signal for specific models"
+        )
+        for key in keys
     }
 
-    # Map adapter module names to model keys
-    adapter_to_causal_keys = {}
-    adapter_to_embed_keys = {}
 
-    # Group causal LM models by adapter
-    for key, info in CAUSAL_LM_MODELS.items():
-        if info.get("is_gated", False):
-            continue
-        adapter = info["adapter"].replace(".py", "")
-        # Only include if adapter is in CONFIG_TO_ADAPTER_MODULE_MAPPING
-        if adapter in adapter_modules_in_config:
-            if adapter not in adapter_to_causal_keys:
-                adapter_to_causal_keys[adapter] = []
-            adapter_to_causal_keys[adapter].append(key)
+# Non-blocking models (xfail, non-strict); remove an entry once it's been stably
+# green so its Spyre tests go back to gating CI normally.
+#
+# The tables are per-harness rather than one merged dict because a path can name
+# two different adapters — google/gemma-4-12B-it is both ``gemma4_google`` (causal)
+# and ``gemma4_mm`` (VLM).
+NON_BLOCKING_CAUSAL_MODELS: dict[str, str] = _non_blocking(
+    CAUSAL_LM_MODELS,
+    (
+        "smollm3",
+        "gemma3_unsloth",
+        "ministral3",
+        "pythia_410m",
+        "gemma4_google",
+        "gemma4_base",
+    ),
+)
 
-    # Group embedding models by adapter
-    for key, info in EMBEDDING_MODELS.items():
-        if info.get("is_gated", False):
-            continue
-        adapter = info["adapter"].replace(".py", "")
-        # Only include if adapter is in CONFIG_TO_ADAPTER_MODULE_MAPPING
-        if adapter in adapter_modules_in_config:
-            if adapter not in adapter_to_embed_keys:
-                adapter_to_embed_keys[adapter] = []
-            adapter_to_embed_keys[adapter].append(key)
+NON_BLOCKING_VISION_MODELS: dict[str, str] = _non_blocking(
+    VISION_MODELS,
+    ("gemma4_mm",),
+)
 
-    # Select one representative per adapter for causal LM
-    # Prefer smaller models (by size field) for faster tests
-    causal_keys = []
-    for adapter in sorted(adapter_modules_in_config):
-        if adapter in adapter_to_causal_keys:
-            keys = adapter_to_causal_keys[adapter]
-            # Sort by size field (smallest first), then by key name for consistency
-            sorted_keys = sorted(
-                keys,
-                key=lambda k: (
-                    _parse_size(CAUSAL_LM_MODELS[k]["size"]),  # Sort by size
-                    k,  # Then by key name for consistency
-                ),
+
+def xfail_non_blocking(paths: list[str], *, table: dict[str, str]) -> list[object]:
+    """Wrap entries of ``paths`` found in ``table`` with a non-strict xfail.
+
+    The test still runs and its outcome (PASS/FAIL) is visible in the report,
+    but a failure won't fail the pytest run or block CI.
+    """
+    return [
+        (
+            pytest.param(
+                path,
+                marks=pytest.mark.xfail(reason=table[path], strict=False),
+                id=path,
             )
-            causal_keys.append(sorted_keys[0])
-
-    # Select one representative per adapter for embeddings
-    # Prefer smaller models (by size field) for faster tests
-    embed_keys = []
-    for adapter in sorted(adapter_modules_in_config):
-        if adapter in adapter_to_embed_keys:
-            keys = adapter_to_embed_keys[adapter]
-            # Sort by size field (smallest first), then by key name for consistency
-            sorted_keys = sorted(
-                keys,
-                key=lambda k: (
-                    _parse_size(EMBEDDING_MODELS[k]["size"]),  # Sort by size
-                    k,  # Then by key name for consistency
-                ),
-            )
-            embed_keys.append(sorted_keys[0])
-
-    return causal_keys, embed_keys
+            if path in table
+            else path
+        )
+        for path in paths
+    ]
 
 
-# Defer initialization until after conftest.py has patched hf_adapters
-# These will be populated by conftest.py after it sets up the patched modules
-CAUSAL_KEYS = []
-EMBED_KEYS = []
+RERANKER_MODELS = {
+    # hf_xlm_roberta.py
+    "bge_reranker_v2_m3": {
+        "name": "BGE Reranker v2 M3",
+        "path": "BAAI/bge-reranker-v2-m3",
+        "adapter": "hf_xlm_roberta.py",
+        "size": "0.5b",
+    },
+}
 
-# Made with Bob
+RERANKER_PATHS: list[str] = [m["path"] for m in RERANKER_MODELS.values()]

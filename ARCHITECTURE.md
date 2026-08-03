@@ -12,7 +12,8 @@ which models are supported on Spyre.
 | Qwen3 0.6B | qwen3 | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite 3.3 8B | granite | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite 3.3 2B | granite | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
-| Granite 4.0 1B | granitemoehybrid | 128 | 64 | Yes | Yes | Yes | Yes |
+| Granite 4.0 1B Base | granitemoehybrid | 128 | 64 | Yes | Yes | Yes | Yes |
+| Granite 4.0 1B Instruct | granitemoehybrid | 128 | 64 | Yes | Yes | Yes | Yes |
 | SmolLM3 3B | smollm3 | 128 | 64 | Yes | Yes | Yes | Yes |
 | Llama 3.2 3B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
 | TinyLlama 1.1B | llama | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
@@ -26,19 +27,40 @@ which models are supported on Spyre.
 | Falcon 3 1B | llama | 256 | 128 | Yes | Yes | Yes | Yes |
 | DeepSeek-Coder 1.3B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
 | Yi 1.5 6B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
-| Granite Vision 4.1 4B | granite (text) | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
+| Granite Vision 4.1 4B (text backbone) | granite (text) | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | Gemma 4 12B | gemma4\_unified | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 12B Base | gemma4\_unified | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 31B | gemma4 | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
 | Gemma 3 1B | gemma3\_text | 256 | 128 | Yes | Yes | Yes | Yes |
 | GPT-2 124M | gpt2 | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
 | GPT-Neo 125M | gpt_neo | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
 | Pythia 70M | gpt_neox | 64→128 | 16 (partial) | Yes (padded) | Yes | Yes | Yes |
+| Ministral-8B Instruct | ministral | 128 | 64 | Yes | Yes | Yes | Yes |
 | Mistral Small 3 24B | mistral3 | 128 | 64 | Yes | Yes | Yes | Yes |
+| Ministral-3 14B Instruct | mistral3 | 128 | 64 | Yes | Yes | Yes | Yes |
 
 **CPU Accurate** = adapter produces identical greedy tokens to stock HF on CPU.
 **Spyre Compiles** = `torch.compile(block_forward)` succeeds on Spyre.
 **Spyre Runs** = block produces output (no crash/NaN).
 
 Unless a row notes otherwise (e.g. `(bf16)`), **verified means verified in fp16** — this holds even for bf16-native checkpoints. A bf16-native model that is only verified in fp16 may behave differently in bf16 on Spyre (and vice versa); the dtype actually tested is what the table certifies.
+
+### Vision-Language (image→text)
+
+Full multimodal VLMs: a vision tower (image → patch features) plus a causal text
+decoder (features + prompt → generated text). Both towers compile and run on
+Spyre; the projector / patch-embed / feature-merge ops that don't lower run on
+CPU (see Multimodal VLM Path below).
+
+| Model | model\_type | Towers | Stick Aligned | CPU Accurate | Spyre Compiles | Spyre Runs |
+|-------|-----------|--------|-----------|--------------|-------------|---------------|-----------|
+| Granite Vision 4.1 4B | granite4\_vision | SigLIP vision + Granite text | Yes (padded) | Yes | Yes | Yes |
+| Mistral-Small-3.1-24B-Instruct-2503 | mistral3 | Pixtral + Mistral text | Yes (padded) | Yes | Yes | Yes |
+| Ministral-3-14B-Instruct-2512 (bf16) | mistral3 | Pixtral + Ministral3 text | Yes (padded) | Yes | Yes | Yes |
+| Gemma 4 12B (bf16) | gemma4\_unified | Encoder-free vision embedder + Gemma 4 text | Yes | Yes | Yes | Yes |
+
+**CPU Accurate** = adapter `generate` matches stock `model.generate` token-for-token on CPU (`test_vlm_e2e_cpu.py`).
+**Spyre Runs** = `test_vlm_e2e_spyre.py` drives the adapter teacher-forced on stock's tokens and asserts per-step logit cosine ≥ 0.999 vs the CPU reference over prefill + decode steps (top-1 agreement is reported, not asserted — an open-ended caption hits near-ties where the fp16-substrate winner is numerically arbitrary; see Multimodal VLM Path). granite-vision-4.1 holds cosine ≥ 0.99991 at every step and produces a correct, coherent caption. Gemma 4 12B runs in **bf16** (like the rest of the Gemma family, it overflows its residual stream in fp16) and holds cosine ≥ 0.99964 at every step with 5/5 top-1 agreement, producing a caption byte-identical to stock.
 
 ### Embedding
 
@@ -84,6 +106,24 @@ single-token decode path (seq_len=1), not an adapter issue.
 
 ## Model Family Coverage
 
+> **Single source of truth.** This section and the Verified Checkpoints
+> tables above are the canonical list of adapters and supported models.
+> README.md does **not** duplicate them — it links here. When you add an
+> adapter or verify a checkpoint, update *only* this file (and the badge
+> counts in README.md, noted below).
+
+**Coverage:** 27 adapters · 46 verified checkpoints · 100+ compatible models.
+The 46 verified rows are 29 generative + 13 embedding + 4 vision-language (see the
+Verified Checkpoints tables above). `hf_siglip_vision` and `hf_pixtral_vision` are
+vision-tower components used by VLM adapters rather than standalone model adapters.
+Granite Vision 4.1 is verified both as a text backbone (generative) and as a full VLM.
+`hf_mistral3_vision_mm` covers both the ``mistral`` text-backbone variant
+(Mistral-Small-3.1/3.2) and the ``ministral3`` variant (Ministral-3-14B-Instruct-2512,
+blocked-FP8, bf16) — both share the Pixtral vision tower; CPU and Spyre verified
+(token-exact on CPU, 5/5 top-1 match on Spyre). `hf_gemma4_mm` is the first
+**encoder-free** VLM: no vision tower, just a projection of processor-merged pixel
+patches into the text embedding space (runs bf16; CPU and Spyre verified).
+
 Each adapter handles a HuggingFace `model_type`. Once verified with
 one checkpoint, all size variants and fine-tunes of that architecture
 work with zero additional code — they share the same attention
@@ -96,11 +136,13 @@ pattern, norms, and weight layout.
 | hf\_granite.py | granite | 3 | Granite 3.3 8B/2B Base, Granite 3.2 8B, Granite 3.1 8B/2B, Granite 3.0 8B, Granite Code 8B/3B |
 | hf\_qwen3.py | qwen3 | 2 | Qwen3 1.7B, Qwen3 4B, Qwen3 8B |
 | hf\_mistral.py | mistral | 2 | Mistral 7B v0.1/v0.2, Mistral 7B Instruct v0.1–v0.3, Zephyr 7B |
-| hf\_mistral3.py | mistral3 | 1 | - |
+| hf\_mistral3.py | mistral3 | 2 | Mistral-Small-3.2 24B, Ministral-3 14B (multimodal text decoder) |
+| hf\_ministral.py | ministral | 1 | Ministral-8B Instruct fine-tunes |
 | hf\_phi3.py | phi3 | 1 | Phi-3 mini 4k/128k, Phi-3 small 8k |
-| hf\_granitemoehybrid.py | granitemoehybrid | 1 | Granite 4.0 Micro |
+| hf\_granitemoehybrid.py | granitemoehybrid | 2 | Granite 4.0 Micro |
 | hf\_smollm3.py | smollm3 | 1 | — |
-| hf\_gemma4.py | gemma4\_unified / gemma4 (dense) | 1 | Gemma 4 31B (dense). Not E2B/E4B (PLE) or 26B-A4B (MoE). |
+| hf\_gemma4.py | gemma4\_unified / gemma4 (dense) | 3 | Not E2B/E4B (PLE) or 26B-A4B (MoE). |
+| hf\_gemma4\_mm.py | gemma4\_unified (multimodal) | 1 | Gemma 4 31B (dense unified VLM). Not E2B/E4B (PLE) or 26B-A4B (MoE). |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
 | hf\_olmo.py | olmo | 1 | OLMo 7B |
 | hf\_olmo2.py | olmo2 | 1 | OLMo 2 7B |
@@ -108,6 +150,10 @@ pattern, norms, and weight layout.
 | hf\_gpt\_neo.py | gpt_neo | 1 | GPT-Neo 1.3B/2.7B, GPT-Neo-style fine-tunes |
 | hf\_gpt\_neox.py | gpt_neox | 1 | Pythia 160M–12B, GPT-NeoX-20B, Dolly v2, StableLM-base-alpha, other GPT-NeoX-arch checkpoints |
 | hf\_granite\_vision.py | granite (text) | 1 | — |
+| hf\_granite\_vision\_mm.py | granite4\_vision (multimodal) | 1 | — |
+| hf\_siglip\_vision.py | SigLIP vision tower | 1 | SigLIP towers of other VLMs (extracted as a bare `SiglipVisionModel`) |
+| hf\_mistral3\_vision\_mm.py | mistral3 (multimodal) | 2 | Mistral-Small-3.1/3.2 Vision; Ministral-3-14B-Instruct-2512 (ministral3 text backbone, bf16) |
+| hf\_pixtral\_vision.py | Pixtral vision tower | 1 | Pixtral towers of Mistral3 Vision checkpoints |
 | hf\_bert.py | bert | 2 | BERT-base, BERT-large, RoBERTa-base/large, other BGE/MiniLM variants |
 | hf\_xlm\_roberta.py | xlm-roberta | 1 | multilingual-e5-large, paraphrase-multilingual-mpnet-base-v2, other XLM-R fine-tunes |
 | hf\_mpnet.py | mpnet | 1 | multi-qa-mpnet-base-{dot,cos}-v1, paraphrase-mpnet-base-v2, microsoft/mpnet-base, all-mpnet-base-v1 |
@@ -133,6 +179,43 @@ outputs = model.generate(tokenizer, ["What is 2+2?"], max_new_tokens=128)
 ```
 
 `AutoSpyreModelForCausalLM` automatically selects the correct adapter based on the model's config type.
+
+### Multimodal (image→text) Auto API
+
+```python
+from hf_adapters import AutoSpyreModelForImageTextToText
+from transformers import AutoProcessor
+
+model = AutoSpyreModelForImageTextToText.from_pretrained("ibm-granite/granite-vision-4.1-4b")
+processor = AutoProcessor.from_pretrained("ibm-granite/granite-vision-4.1-4b")
+
+# Build the batch the official way (chat template tokenizes + expands image tokens).
+conv = [{"role": "user", "content": [
+    {"type": "image", "image": image},
+    {"type": "text", "text": "Briefly describe this image."},
+]}]
+batch = processor.apply_chat_template(
+    conv, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
+)
+
+texts = model.generate(
+    processor,
+    batch["input_ids"], batch["attention_mask"],
+    batch["pixel_values"], batch["image_sizes"],
+    max_new_tokens=64,
+)
+```
+
+`AutoSpyreModelForImageTextToText` loads the full VLM via
+`AutoModelForImageTextToText`, prepares **both** towers for Spyre, and attaches
+Spyre-aware `prefill_logits` (image + text → first-token logits) and `generate`
+(full image→text decode). A multimodal config is registered in both auto-mappings:
+`AutoSpyreModelForCausalLM` selects the *text-only* adapter (discards the vision
+tower), while `AutoSpyreModelForImageTextToText` selects the *combined* two-tower
+adapter. This applies to `Granite4VisionConfig` → `hf_granite_vision_mm`,
+`Mistral3Config` → `hf_mistral3_vision_mm`, and `Gemma4UnifiedConfig` →
+`hf_gemma4_mm` (the last is encoder-free — a vision projection, not a two-tower
+model).
 
 ### Manual Control API
 
@@ -171,25 +254,8 @@ hf_adapters/
 │   pad_attention_heads, patch_rmsnorm, pad_lm_head,
 │   kv_cache_update, build_prefill_mask,
 │   build_expansion_mask, load_model_common, generate
-├── hf_granite.py          — Granite 3.3 adapter
-├── hf_granite_vision.py   — Granite Vision 4.1 text backbone adapter
-├── hf_qwen3.py            — Qwen3 adapter
-├── hf_granitemoehybrid.py — Granite 4.0 dense adapter
-├── hf_smollm3.py          — SmolLM3 adapter
-├── hf_llama.py            — Llama adapter (Llama 1/2/3, Code Llama, Yi, TinyLlama)
-├── hf_qwen2.py            — Qwen2 adapter (Qwen 1.5, Qwen 2, Qwen 2.5)
-├── hf_mistral.py          — Mistral adapter (Mistral 7B v0.2, v0.3)
-├── hf_mistral3.py         — Mistral3 adapter (Mistral 3 24B)
-├── hf_phi3.py             — Phi-4 mini adapter
-├── hf_olmo.py             — OLMo adapter (OLMo 1B, 7B)
-├── hf_olmo2.py            — OLMo2 adapter (OLMo 2 7B)
-├── hf_gpt2.py             — GPT-2 adapter (learned abs pos, LayerNorm, Conv1D)
-├── hf_gpt_neo.py          — GPT-Neo adapter (learned abs pos, LayerNorm, nn.Linear)
-├── hf_gpt_neox.py         — GPT-NeoX adapter (partial RoPE, parallel residual, fused QKV)
-├── hf_bert.py             — BERT-family encoder adapter (BGE, MiniLM)
-├── hf_xlm_roberta.py      — XLM-RoBERTa encoder adapter (BGE-M3, multilingual-e5)
-├── hf_mpnet.py            — MPNet encoder adapter (all-mpnet-base-v2 and variants)
-├── hf_modernbert.py       — ModernBERT encoder adapter (RoPE, GeGLU, local/global attention)
+├── hf_*.py               — one adapter per model family (see the
+│                           Model Family Coverage table above for the full list)
 └── __init__.py
 ```
 
@@ -336,7 +402,7 @@ modification:
 | Fused MLP split | No | No | No | Yes | No | No | No | No | Yes | No | No | No | No |
 | NoPE layers | No | No | No | No | Yes | No | No | No | No | No | No | No | No |
 | Partial RoPE | No | No | No | No | No | No | No | No | Yes | No | No | No | Yes (global layers) |
-| Head-dim padding | 2B only | Yes (64→128) | No | No | No | TinyLlama | No | No | No | No | No | No | No |
+| Head-dim padding | 2B only | Yes (64→128) | No | Micro only (64→128) | No | TinyLlama | No | No | No | No | No | No | No |
 | Custom model loading | No | Yes (safetensor remap) | No | No | No | No | No | No | No | No | No | No | No |
 | Attention scaling | `config.attention_multiplier` | `config.attention_multiplier` | `head_dim**-0.5` | `config.attention_multiplier` | `head_dim**-0.5` | `head_dim**-0.5` | `head_dim**-0.5` | `head_dim**-0.5` | `head_dim**-0.5` | `head_dim**-0.5` | `head_dim**-0.5` | `query_pre_attn_scalar**-0.5` | `1.0` (unscaled) |
 | Norm type | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | RMSNorm (pre) | LayerNorm (pre, no weight) | RMSNorm (post) | RMSNorm (sandwich) | RMSNorm (sandwich) |
@@ -359,10 +425,13 @@ cost of chunking. Kept as the escape hatch for future models.
 into separate linears at prepare time. Avoids stickify non-zero
 offset assertions.
 
-**Head-dim padding** (Granite 2B, TinyLlama, Granite Vision): `pad_attention_heads()`
+**Head-dim padding** (Granite 2B, TinyLlama, Granite Vision, Granite 4.0 Micro): `pad_attention_heads()`
 zero-pads Q/K/V/O projections and RoPE freqs from 64→128 so
 D/2 = 64 (one stick). Q/K use interleaved padding per RoPE
-`[2, D/2]` group; V/O use simple end-padding.
+`[2, D/2]` group; V/O use simple end-padding. Granite 4.0 Micro has
+`hidden_size=2560` / `num_attention_heads=40` → `head_dim=64`, which requires
+the same 64→128 padding as the other sub-stick models; the 1B variant
+(`head_dim=128`) needs no padding.
 
 **Custom model loading** (Granite Vision): The text backbone weights
 are extracted from a multimodal checkpoint (vision+text) via safetensor
@@ -460,6 +529,154 @@ pre-norm state and sum into the residual together. `nn.LayerNorm` and exact
 `gelu` need no patching. Backbone at `model.gpt_neox`
 (`embed_in`/`layers`/`final_layer_norm`); LM head is `embed_out`.
 
+### Multimodal VLM Path (vision tower + text decoder)
+
+Two adapters compose into a full image→text VLM. They are the first multimodal
+support and the first vision-encoder support in the repo.
+
+**SigLIP vision tower** (`hf_siglip_vision.py`): a **pre-LN, bidirectional,
+no-RoPE, no-KV-cache** ViT encoder over a fixed patch sequence (Granite Vision
+4.1: 384/16 → 576 patches = 9·64, stick-aligned). Built with
+`make_vision_encoder_block` (the pre-LN counterpart of the BERT-style post-LN
+`make_encoder_block`) and driven by `prefill_vision` → `vision_backbone_forward`.
+SigLIP-specific Spyre adaptations:
+
+- **Head-dim padding 72→128.** `head_dim = 1152/16 = 72` (`D/2 = 36 < 64`), so
+  Q/K/V/O are zero-padded to the next stick multiple with the SDPA scale held at
+  `1/sqrt(72)`. (The RoPE-matmul rule doesn't apply — SigLIP has no RoPE — but the
+  reshape/SDPA still want a stick-aligned head_dim.)
+- **MLP intermediate padding** (`_pad_vision_mlp`). SigLIP's `intermediate_size`
+  (4304 for Granite Vision 4.1) is *not* a stick multiple, so the `fc2` matmul's
+  contraction (K) dim is stick-misaligned and the compiler aborts in DDL
+  conversion (`_extend_matmul_k_to_padded: could not identify K symbol` →
+  `Could not find any suitable dimension mapping` → `dxp_standalone` SIGABRT).
+  Unlike `hidden_size` (residual stream — can't pad), the FFN intermediate is
+  private, so `fc1` out-rows/bias and `fc2` in-cols are zero-padded to a stick
+  boundary (4304→4352 = 68·64). Bit-exact: the extra activations are zero and
+  multiply zero `fc2` columns. (Same reasoning as head-dim/LM-head padding, now
+  applied to the FFN width.)
+- **Conv2d patch embed runs on CPU.** `nn.Conv2d` (`aten.convolution`) does not
+  lower on Spyre (layout pass rejects its stick expression — see
+  docs/siglip_vision_spyre_findings.md), so the patch embedding + learned
+  position add run on CPU and the result is moved to Spyre. CPU copies of the
+  conv weight/bias and position table are snapshotted at prepare time so the
+  closure survives the blanket device move (`_embedding_param_ids` can't exclude
+  a 4-D conv weight).
+
+**Combined two-tower adapter — Granite** (`hf_granite_vision_mm.py`): runs the
+Spyre SigLIP tower, projects/packs its features, splices them into the
+text-embedding stream at `<image>` positions, and runs the Granite text decoder
+(reusing `hf_granite`'s compiled block + the shared `generate`/KV machinery,
+embedding-driven so prefill can carry the image injection). Granite Vision 4.1
+uses a multi-layer **deepstack + spatial** injection: several vision layers and
+spatial offset groups are projected by their own Blip2-QFormer projectors and
+**summed** into the image-token positions before the mapped decoder layers
+(`_inject_deepstack`). Multimodal-specific Spyre adaptations:
+
+- **Projectors + `image_newline` stay on CPU.** The Blip2-QFormer projectors and
+  `pack_image_features` are stock CPU modules (vision features are moved to CPU
+  first); the blanket device move is undone for them before use, the same
+  CPU-fallback contract as the patch-embed conv.
+- **Deepstack injection scattered on CPU** (`_inject_deepstack`). Stock does
+  `h.masked_scatter(mask, h[mask] + features)`; on Spyre the image slots are zeroed
+  at embed time, so the injection is `h + additive` where `additive` is `features`
+  scattered into image positions on CPU (the bool `mask.sum()`, boolean indexing,
+  and `masked_scatter` don't lower on Spyre — same doctrine as the gemma3/common
+  mask-band helpers, which build int/bool work on CPU and return a device float).
+  Image-slot zeroing uses an elementwise `* keep` multiply, not `masked_fill_`
+  (which doesn't lower either).
+- **Token-embedding gather follows the table's device** — `embed_tokens` lives on
+  Spyre after the move, so prefill ids are moved to the table's device (matching
+  the decode step), then masking happens on-device.
+
+**Pixtral vision tower** (`hf_pixtral_vision.py`): a **pre-LN, bidirectional,
+2D-RoPE** ViT encoder used by Mistral3 Vision checkpoints. Key differences from
+the SigLIP tower:
+
+- **2D RoPE.** Pixtral encodes patch positions with a 2D `(row, col)` meshgrid
+  mapped through a pre-computed `[max_patches, head_dim]` `inv_freq` table.
+  Stock applies it via `rotate_half` (slices along head_dim — Spyre-incompatible).
+  The adapter converts the per-image position ids into `[P, 2, 2, D/2]`
+  rotation matrices at prepare time via `_build_pixtral_rope_matrices` and applies
+  them with `apply_rope_matmul` (no slicing). The rotation matrices are re-built
+  per image at inference time (shape `P` varies) from the snapshotted `inv_freq`.
+- **Block-diagonal attention mask.** When multiple images are batched into one
+  sequence, each image's patches attend only within that image. Built on CPU as an
+  additive fp16 mask (`_build_block_attn_mask`) and moved to Spyre.
+- **SwiGLU MLP** (`gate_proj` × `up_proj` → `down_proj`), unlike SigLIP's GELU-tanh
+  two-layer MLP. No MLP intermediate padding needed (`intermediate_size=4096` is a
+  multiple of 64).
+- **`PixtralRMSNorm`** (pre-LN on both attention and MLP sub-layers) patched via
+  `patch_rmsnorm`, same as text decoders.
+- **Head-dim padding 64→128** (`_pad_pixtral_heads`). Pixtral's default
+  `head_dim = 1024/16 = 64` (`D/2 = 32 < 64`), below one stick. Q/K/V/O are
+  zero-padded to 128 with the SDPA scale held at `1/sqrt(64)`.
+- **Conv2d patch embed runs on CPU.** Snapshotted at prepare time (same
+  CPU-fallback contract as SigLIP).
+
+**Combined two-tower adapter — Mistral3** (`hf_mistral3_vision_mm.py`): runs the
+Spyre Pixtral tower, applies the stock `multi_modal_projector` (RMSNorm +
+`Mistral3PatchMerger` + two linear layers) on CPU, then scatters the image
+features into the text-embedding stream once before decoder layer 0. Mistral3
+uses a simpler **flat single-injection** pattern (contrast with Granite's
+deepstack multi-layer injection):
+
+1. Run Pixtral tower with `output_hidden_states=True`.
+2. Select `vision_feature_layer` hidden state(s), apply `multi_modal_projector`
+   on CPU → `image_features [N_img_tokens, text_hidden]`.
+3. Zero the `[IMG]` token slots in text embeddings (`* keep` elementwise mul);
+   scatter `image_features` into those slots via a CPU-built additive tensor
+   (same Spyre-safe technique as `_inject_deepstack`).
+4. Run the full Mistral text decoder once with the resulting `inputs_embeds`.
+   Decode steps are pure text — no image re-encoding.
+
+Multimodal-specific Spyre adaptations (beyond those shared with Granite VLM):
+
+- **`_spyre_text_blocks` vs `_spyre_compiled_blocks`** — `prepare_for_spyre`
+  explicitly stores Mistral decoder blocks in `model._spyre_text_blocks` to avoid
+  collision with the vision tower's compiled blocks stored by
+  `hf_pixtral_vision.prepare_for_spyre` in `model._spyre_compiled_blocks`.
+- **`multi_modal_projector` pinned to CPU** after `_move_to_spyre_with_layout`
+  (same pattern as Granite's `layerwise_projectors` pin).
+- **`Mistral3PatchMerger`** (`nn.functional.unfold` + `merging_layer`) runs on
+  CPU inside the projector — `unfold` doesn't lower on Spyre.
+
+**Encoder-free VLM — Gemma 4** (`hf_gemma4_mm.py`): the first VLM with **no
+vision tower**. Gemma 4 is unified (`model_type=gemma4_unified`); vision is a pure
+projection of processor-merged raw pixel patches (the image processor already
+merges `pooling_kernel_size²` 16×16 patches into each 48×48 merged patch, 1:1 to a
+soft token) into the LM embedding space — no attention, no RoPE, no KV cache. The
+adapter loads the full VLM via `AutoModelForImageTextToText`, projects the patches,
+scatters them into the `<image>` token slots, and runs the `hf_gemma4` text decoder
+unchanged (both towers live under the one model, so a single `prepare_for_spyre`
+covers them). Gemma4-specific Spyre adaptations:
+
+- **Vision embedder compiled on Spyre.** The attention-free projection core
+  (`LN₁ → Dense → LN₂ → +pos_embs → pos_norm → RMSNorm → Linear`) is
+  `torch.compile`d and runs on Spyre. Only the integer-XY positional-embedding
+  gather (with `-1` padding validity masking) and the final padding-patch strip run
+  on **CPU** — those integer-gather / boolean-index ops don't lower (same doctrine
+  as the SigLIP CPU patch-embed). The CPU-built per-patch positional-embedding
+  tensor is passed into the compiled core as a device argument.
+- **Vision LayerNorms un-fused + fp32 reduction** (`patch_layernorm`). The three
+  vision `nn.LayerNorm`s NaN on Spyre's fused lowering on near-constant (small but
+  nonzero variance) rows — in **both** bf16 and fp16, so it's a genuine lowering
+  defect, not a range issue. The fix is a device-conditional un-fused rewrite with
+  the mean/variance reduction promoted to fp32 (same doctrine as `patch_rmsnorm`'s
+  CPU branch), keeping the affine multiply in bf16. Without it the VLM logits are
+  all-NaN (see docs/gemma4_mm_vision_layernorm_spyre.md).
+- **Bidirectional vision attention at prefill.** `use_bidirectional_attention ==
+  "vision"`: within one image the soft-tokens attend bidirectionally. Stock OR-s a
+  blockwise band (same image group ⇒ allowed) into the causal mask for **both**
+  full and sliding layers, so at prefill the adapter builds `full = OR(causal,
+  blockwise)` and `sliding = AND(sliding_window, OR(causal, blockwise))`. Decode
+  steps are pure text (one new causal token), so no blockwise band after prefill.
+- **Runs in bf16.** Like the rest of the Gemma family (Gemma 3 / EmbeddingGemma),
+  Gemma 4 overflows its residual stream in fp16 (`inf` → NaN end-to-end), so it
+  runs in bf16. This is a separate concern from the vision LayerNorm defect above,
+  which is a device lowering bug fixed device-conditionally in either dtype — not
+  the reason bf16 was chosen. Audio and video inputs are asserted out loudly.
+
 ## Adding a New Model
 
 See [ONBOARDING.md](ONBOARDING.md) for the full step-by-step guide,
@@ -482,6 +699,9 @@ see [docs/fms_comparison.md](docs/fms_comparison.md).
 | `partial_rotary_factor < 1.0` | Non-zero offset assertion in stickify | Identity-padded rotation matrices in `PartialPrecomputedRotaryEmbedding` (implemented in `hf_phi3.py`) |
 | Zero-length tensors crash `copy_host_to_device` | Segfault on `.to("spyre")` | Create empty tensors directly on device |
 | fp16 overflow on CPU for large multipliers | NaN logits on CPU | Test in float32; runs fine on Spyre |
+| Stick-misaligned matmul K dim | DDL conversion aborts (`could not identify K symbol` → `dxp_standalone` SIGABRT) — hits SigLIP's `intermediate_size=4304` | Zero-pad the private dim to a stick boundary (`_pad_vision_mlp`); bit-exact |
+| `nn.Conv2d` (`aten.convolution`) doesn't lower | Patch-embed compile fails in layout pass | Run the Conv2d on CPU (CPU-snapshot weights), move result to Spyre |
+| `masked_fill_` / `masked_scatter` / `bool.sum()` / boolean indexing don't lower | Image-slot zeroing + deepstack injection crash | Zero via `* keep` mul; build the injection additive on CPU and elementwise-add on device |
 
 ### Performance Issues
 

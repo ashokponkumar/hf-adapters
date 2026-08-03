@@ -40,23 +40,35 @@ The DEVICE='cpu' patching of ``hf_common`` happens once in
 """
 
 import gc
+import sys
+import types
 
 import pytest
 import torch
-from conftest import encode_padded, min_cosine, torch_dtype_for
-from model_registry import EMBEDDING_MODELS
 from transformers import AutoModel, AutoTokenizer
 
-PROMPTS = [
+from tests.conftest import (
+    get_dtype_for_cpu,
+    load_ref_model,
+    resolve_adapter_module_for_test,
+)
+from tests.cpu.conftest import _unwrap_compiled_blocks, encode_padded, min_cosine
+from tests.model_registry import EMBED_PATHS
+
+PROMPTS: list[str] = [
     "The capital of France is Paris.",
     "Sentence embeddings are useful.",
 ]
-COS_THRESHOLD = 0.999
-
-MODELS = {k: v for k, v in EMBEDDING_MODELS.items() if v.get("adapter") is not None}
+COS_THRESHOLD: float = 0.999
 
 
-def _run_prefill(adapter_mod, hf_common_mod, model, input_ids, attention_mask):
+def _run_prefill(
+    adapter_mod: types.ModuleType,
+    hf_common_mod: types.ModuleType,
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
     """Dispatch to prefill_encoder or prefill_embed based on adapter type."""
     if getattr(adapter_mod, "_is_encoder_only", False):
         return hf_common_mod.prefill_encoder(
@@ -68,69 +80,21 @@ def _run_prefill(adapter_mod, hf_common_mod, model, input_ids, attention_mask):
         )
 
 
-@pytest.mark.parametrize("model_key", list(MODELS.keys()), ids=list(MODELS.keys()))
-def test_manual_path(
-    model_key, load_adapter, unwrap_compiled_blocks, set_rope_dtype, hf_common_mod
-):
-    info = MODELS[model_key]
-    adapter_mod = load_adapter(info["adapter"])
-    torch_dtype = torch_dtype_for(info)
+@pytest.mark.parametrize("model_path", EMBED_PATHS, ids=EMBED_PATHS)
+def test_auto_loader(model_path: str) -> None:
+    auto_spyre_model = sys.modules["hf_adapters.auto_spyre_model"]
+    hf_common_mod = sys.modules["hf_adapters.hf_common"]
+    torch_dtype = get_dtype_for_cpu(model_path=model_path)
+    adapter_module = resolve_adapter_module_for_test(model_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(info["path"])
-    input_ids, attention_mask = encode_padded(tokenizer, PROMPTS)
-
-    # HF reference
-    model = AutoModel.from_pretrained(info["path"], dtype=torch_dtype, device_map="cpu")
-    model.eval()
-    model.requires_grad_(False)
-    with torch.no_grad():
-        ref_hidden = model(
-            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
-        ).last_hidden_state
-    del model
-    gc.collect()
-
-    # Adapter (fresh load — prepare_for_spyre is destructive on the instance)
-    model = AutoModel.from_pretrained(info["path"], dtype=torch_dtype, device_map="cpu")
-    model.eval()
-    model.requires_grad_(False)
-    adapter_mod.prepare_for_spyre(model)
-    # Manual path skips load_model_common; propagate the chosen dtype to the
-    # RoPE freq cache like the production move does (needed for bf16 models).
-    set_rope_dtype(model, torch_dtype)
-    unwrap_compiled_blocks(model)
-    with torch.no_grad():
-        adapter_hidden, _ = _run_prefill(
-            adapter_mod, hf_common_mod, model, input_ids, attention_mask
-        )
-    del model
-    gc.collect()
-
-    assert (
-        adapter_hidden.shape == ref_hidden.shape
-    ), f"shape mismatch: adapter {adapter_hidden.shape} vs ref {ref_hidden.shape}"
-    min_cos = min_cosine(adapter_hidden, ref_hidden, attention_mask)
-    assert (
-        min_cos >= COS_THRESHOLD
-    ), f"min per-token cosine {min_cos:.6f} < threshold {COS_THRESHOLD}"
-
-
-@pytest.mark.parametrize("model_key", list(MODELS.keys()), ids=list(MODELS.keys()))
-def test_auto_loader(
-    model_key, auto_spyre_model, unwrap_compiled_blocks, hf_common_mod
-):
-    info = MODELS[model_key]
-    torch_dtype = torch_dtype_for(info)
-
-    tokenizer = AutoTokenizer.from_pretrained(info["path"])
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
     input_ids, attention_mask = encode_padded(tokenizer, PROMPTS)
 
     # HF reference (loaded fresh, before the auto-loader path).
-    ref_model = AutoModel.from_pretrained(
-        info["path"], dtype=torch_dtype, device_map="cpu"
+    ref_model = load_ref_model(
+        model_path=model_path, adapter_mod=adapter_module, auto_model_cls=AutoModel
     )
-    ref_model.eval()
-    ref_model.requires_grad_(False)
+
     with torch.no_grad():
         ref_hidden = ref_model(
             input_ids=input_ids, attention_mask=attention_mask, return_dict=True
@@ -140,12 +104,11 @@ def test_auto_loader(
 
     # Auto-loader path
     model = auto_spyre_model.AutoSpyreModel.from_pretrained(
-        info["path"], dtype=torch_dtype
+        model_path, dtype=torch_dtype
     )
-    unwrap_compiled_blocks(model)
-    adapter_module = auto_spyre_model._resolve_adapter_module(info["path"])
+    _unwrap_compiled_blocks(model)
     with torch.no_grad():
-        adapter_hidden, _ = _run_prefill(
+        adapter_hidden = _run_prefill(
             adapter_module, hf_common_mod, model, input_ids, attention_mask
         )
     del model

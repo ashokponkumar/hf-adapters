@@ -23,15 +23,20 @@ import os
 import sys
 from pathlib import Path
 
-from hf_model_catalog import (
+from huggingface_hub import HfApi
+from huggingface_hub.hf_api import ModelInfo
+
+from utils.hf_model_catalog import (
     EXPAND_FIELDS,
     RESOURCES_DIR,
     build_catalog,
+    contains_remote_code,
+    has_loadable_weights,
     is_baseline_keep,
     tags,
+    with_transient_retry,
 )
-from huggingface_hub import HfApi
-from huggingface_hub.hf_api import ModelInfo
+from utils.utilities import ts
 
 # Pipeline tags that embedding models are filed under. They are mutually
 # exclusive (one primary tag per model), so we query both and union.
@@ -114,43 +119,69 @@ def _is_multimodal(model: ModelInfo, _config_class: str | None = None) -> bool:
 def _fetch(api: HfApi, limit: int) -> list[ModelInfo]:
     """Query both embedding pipeline tags and return a deduplicated list,
     sorted by downloads descending. Over-fetched (x2) to absorb the noise +
-    rerankers + GGUF/MLX entries removed by the filter."""
+    rerankers + GGUF/MLX entries removed by the filter.
+
+    Each per-tag call is wrapped in ``with_transient_retry`` so a mid-fetch
+    504 from the HF gateway does not abort the run.
+    """
+    print(f"{ts()} Fetching top {limit} text-embedding models by downloads...")
     per_tag_limit: int = int(limit * 2)
     by_id: dict[str, ModelInfo] = {}
     for tag in EMBEDDING_PIPELINE_TAGS:
         print(f"Fetching up to {per_tag_limit} '{tag}' models by downloads...")
-        for m in api.list_models(
-            pipeline_tag=tag,
-            sort="downloads",
-            limit=per_tag_limit,
-            expand=EXPAND_FIELDS,
-        ):
+        models: list[ModelInfo] = with_transient_retry(
+            lambda t=tag: api.list_models(
+                pipeline_tag=t,
+                sort="downloads",
+                limit=per_tag_limit,
+                expand=EXPAND_FIELDS,
+            ),
+            description=f"list_models[{tag}]",
+        )
+        for m in models:
             # First tag wins on dupes; they carry identical metadata anyway.
             by_id.setdefault(m.id, m)
 
     return sorted(by_id.values(), key=lambda m: (m.downloads or 0), reverse=True)
 
 
-def _keep(model: ModelInfo) -> bool:
+def keep(model: ModelInfo, token: str | bool) -> bool:
+    """Keep predicate for the embedding fetcher.
+
+    Ordering matters: the cheap metadata-only checks run first so we only
+    spend the ``has_loadable_weights`` HTTP call on the ~1k candidates that
+    would otherwise survive.
+    """
     if not is_baseline_keep(model):
         return False
     if not _has_embedding_signal(model):
         return False
     if _is_reranker(model):
         return False
+    if model.gated:
+        return False
+    if contains_remote_code(model):
+        return False
+    if not has_loadable_weights(model, token):
+        return False
     return True
 
 
 def fetch_top_embedding_models(
     limit: int, output_csv: Path | str | None = None
-) -> None:
-    if output_csv is None:
-        output_csv = RESOURCES_DIR / "top_embedding_models.csv"
-    token: str | bool = os.environ.get("HF_TOKEN", True)
+) -> list[dict[str, object]]:
+    # Falls back to False (explicit anonymous access), not True: in
+    # huggingface_hub, token=True means "use the locally cached login token,
+    # and raise LocalTokenNotFoundError if none exists" — it does NOT mean
+    # "anonymous is fine". A CI runner with no `hf auth login` would raise on
+    # every call with that fallback. `or False` also covers GHA setting
+    # HF_TOKEN to an empty string (rather than omitting it) when the secret
+    # doesn't exist, which `.get(..., True)` alone would not catch.
+    token: str | bool = os.environ.get("HF_TOKEN") or False
     api: HfApi = HfApi(token=token)
-    build_catalog(
+    return build_catalog(
         fetch_fn=lambda lim: _fetch(api, lim),
-        filter_fn=_keep,
+        filter_fn=lambda m: keep(m, token),
         limit=limit,
         output_csv=output_csv,
         label="embedding",
@@ -162,4 +193,6 @@ def fetch_top_embedding_models(
 
 if __name__ == "__main__":
     limit_: int = int(sys.argv[1]) if len(sys.argv) > 1 else 10000
-    fetch_top_embedding_models(limit=limit_)
+    fetch_top_embedding_models(
+        limit=limit_, output_csv=RESOURCES_DIR / "top_embedding_models.csv"
+    )

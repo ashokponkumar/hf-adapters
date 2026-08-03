@@ -8,17 +8,24 @@ columns* it wants on top of the shared schema.
 """
 
 import csv
+import logging
 import re
-from collections.abc import Callable, Iterable
+import time
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import TypeVar
 
+from huggingface_hub.errors import HfHubHTTPError
 from huggingface_hub.hf_api import ModelInfo
 from tqdm import tqdm
 from transformers import AutoConfig
 
 # Import the mapping to get supported config classes dynamically
 from hf_adapters.auto_spyre_model import CONFIG_TO_ADAPTER_MODULE_MAPPING
+
+logging.getLogger("transformers").setLevel(logging.ERROR)
+
 
 # Get the resources directory (parent of resources/__init__.py)
 RESOURCES_DIR: Path = Path(__file__).resolve().parent.parent / "resources"
@@ -34,6 +41,51 @@ EXPAND_FIELDS: list[str] = [
     "library_name",
     "tags",
 ]
+
+# HF-API gateway 5xx statuses. Anything outside this set (400/401/403/404/...)
+# is a permanent failure and must not be retried.
+_TRANSIENT_HTTP_STATUSES: frozenset[int] = frozenset({500, 502, 503, 504})
+_MAX_FETCH_ATTEMPTS: int = 5
+_MAX_BACKOFF_SECONDS: float = 60.0
+
+_T = TypeVar("_T")
+
+
+def with_transient_retry(
+    call: Callable[[], Iterator[_T] | Iterable[_T]],
+    description: str,
+) -> list[_T]:
+    """Materialize an HF paginated call, retrying transient 5xx failures.
+
+    *call* is expected to return an iterable of ``ModelInfo`` (or similar)
+    from a ``huggingface_hub`` API method. It is fully consumed into a list
+    on each attempt because the pagination endpoint's failure mode is a
+    mid-stream 504, and there is no way to resume — the whole traversal has
+    to restart. Transient statuses (500/502/503/504) trigger up to
+    ``_MAX_FETCH_ATTEMPTS`` retries with exponential backoff capped at
+    ``_MAX_BACKOFF_SECONDS``; any other error propagates immediately.
+    """
+    last_error: HfHubHTTPError | None = None
+    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+        try:
+            return list(call())
+        except HfHubHTTPError as e:
+            status: int | None = (
+                e.response.status_code if e.response is not None else None
+            )
+            if status not in _TRANSIENT_HTTP_STATUSES:
+                raise
+            last_error = e
+            backoff: float = min(_MAX_BACKOFF_SECONDS, 2.0**attempt)
+            print(
+                f"    {description}: HF API returned {status} "
+                f"(attempt {attempt}/{_MAX_FETCH_ATTEMPTS}); "
+                f"retrying in {backoff:.0f}s..."
+            )
+            time.sleep(backoff)
+    assert last_error is not None
+    raise last_error
+
 
 MOE_MODEL_TYPES: set[str] = {
     "mixtral",
@@ -100,20 +152,99 @@ def is_custom_code(model: ModelInfo) -> bool:
     return bool(config.get("auto_map"))
 
 
+def is_nsfw(model: ModelInfo) -> bool:
+    if "nsfw" in tags(model):
+        return True
+    return False
+
+
 # Repo-id substrings marking non-native conversions (ONNX/GGUF/MLX), dropped.
 NON_NATIVE_ID_SUBSTRINGS: tuple[str, ...] = ("onnx", "gguf", "mlx")
 
 
 def is_baseline_keep(model: ModelInfo) -> bool:
-    """Shared inclusion gate: drop config-less, GGUF/MLX, and ONNX/GGUF/MLX id checkpoints."""
+    """Shared inclusion gate: drop config-less, and ONNX/GGUF/MLX id checkpoints."""
     if not model.config:
         return False
-    if model.library_name in ("gguf", "mlx"):
+    if model.library_name in NON_NATIVE_ID_SUBSTRINGS:
         return False
     model_id_lower: str = model.id.lower()
     if any(sub in model_id_lower for sub in NON_NATIVE_ID_SUBSTRINGS):
         return False
+    if "nsfw" in tags(model):
+        return False
     return True
+
+
+def contains_remote_code(model: ModelInfo) -> bool:
+    """Return False if the model requires trust_remote_code=True to load its config."""
+    try:
+        AutoConfig.from_pretrained(model.id, trust_remote_code=False)
+        return False
+    except (ValueError, OSError):
+        return True
+
+
+# Session-scoped cache for _has_loadable_weights. Keyed by repo_id; values are
+# the bool result. The fetchers run twice a week in a fresh process, and repo
+# file lists rarely change within a single run, so a plain dict is enough — no
+# TTL or on-disk persistence needed.
+_LOADABLE_WEIGHTS_CACHE: dict[str, bool] = {}
+
+# Filenames transformers' AutoModel.from_pretrained recognizes as native
+# weights (single-file or sharded via the matching index.json).
+_NATIVE_WEIGHT_FILES: frozenset[str] = frozenset(
+    {
+        "pytorch_model.bin",
+        "model.safetensors",
+        "pytorch_model.bin.index.json",
+        "model.safetensors.index.json",
+    }
+)
+
+
+def has_loadable_weights(model: ModelInfo, token: str | bool) -> bool:
+    """True if the repo ships weights AutoModel.from_pretrained can consume.
+
+    Detects three unloadable classes without downloading any weight files
+    — one ``list_repo_files`` call per repo:
+
+    * adapter-only repos (LoRA/PEFT, `adapter_config.json` but no full model),
+    * GGUF/MLX/ONNX-only repos that slipped past the id-substring filter,
+    * abandoned uploads with a config but no weight files at all.
+
+    Cached in-process by repo_id: transformers repos are effectively immutable
+    within a fetcher run, and each fetcher process is short-lived.
+    """
+    from huggingface_hub import HfApi
+
+    cached = _LOADABLE_WEIGHTS_CACHE.get(model.id)
+    if cached is not None:
+        return cached
+
+    api: HfApi = HfApi(token=token)
+    try:
+        files: list[str] = with_transient_retry(
+            lambda: api.list_repo_files(model.id, token=token),
+            description=f"list_repo_files[{model.id}]",
+        )
+    except Exception:
+        # Any permanent failure (404, gated without token, ...) — treat as
+        # not loadable rather than raising into the fetcher's filter path.
+        _LOADABLE_WEIGHTS_CACHE[model.id] = False
+        return False
+
+    lower_files: set[str] = {f.lower() for f in files}
+
+    # Adapter-only repos ship adapter_config.json + adapter_model.safetensors
+    # and expect PeftModel.from_pretrained(base, ...), not AutoModel directly.
+    if "adapter_config.json" in lower_files:
+        _LOADABLE_WEIGHTS_CACHE[model.id] = False
+        return False
+
+    result: bool = any(name in lower_files for name in _NATIVE_WEIGHT_FILES)
+    _LOADABLE_WEIGHTS_CACHE[model.id] = result
+    return result
 
 
 def format_number_to_billions_smart(num: int | float) -> str:
@@ -178,7 +309,7 @@ def get_param_count(model: ModelInfo) -> int | None:
 def get_config_type(model_id: str, token: str | bool) -> str | None:
     try:
         model_config = AutoConfig.from_pretrained(
-            model_id, token=token, trust_remote_code=True
+            model_id, token=token, trust_remote_code=False
         )
         return type(model_config).__name__
     except Exception:
@@ -209,37 +340,54 @@ def build_catalog(
     fetch_fn: Callable[[int], Iterable[ModelInfo]],
     filter_fn: Callable[[ModelInfo], bool],
     limit: int,
-    output_csv: Path | str,
+    output_csv: Path | str | None,
     label: str,
     extra_columns: (
         list[tuple[str, Callable[[ModelInfo, str | None], object]]] | None
     ) = None,
     allow_millions: bool = False,
     token: str | bool,
-) -> None:
-    """Fetch → filter → enrich → write a ranked model catalog CSV.
+) -> list[dict[str, object]]:
+    """Fetch → filter → enrich → return a ranked model catalog as a list of dicts.
 
     Args:
         fetch_fn: callable(limit) -> list of raw model objects (over-fetched).
         filter_fn: callable(model) -> bool, keep the model if True.
         limit: number of rows to write after filtering.
-        output_csv: destination path.
+        output_csv: destination path, or None to skip writing.
         label: human-readable noun for log lines (e.g. "generative").
         extra_columns: optional list of (header, value_fn) where
             value_fn(model, config_class) -> cell. Inserted before config_class.
         allow_millions: pass-through to the size-name extractor.
         token: HF token (or True) for AutoConfig downloads.
+
+    Returns:
+        List of dicts, one per model, keyed by column name.
     """
     extra_columns = extra_columns or []
+
+    def _safe_filter(model: ModelInfo) -> bool:
+        try:
+            return filter_fn(model)
+        except Exception as e:
+            logging.warning("filter_fn failed for %s: %s", model.id, e)
+            return False
 
     candidates: list[ModelInfo] = list(fetch_fn(limit))
     print(f"Retrieved {len(candidates)} raw {label} candidates.")
 
-    models: list[ModelInfo] = [m for m in candidates if filter_fn(m)]
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        keep_flags: list[bool] = list(
+            tqdm(
+                ex.map(_safe_filter, candidates),
+                total=len(candidates),
+                desc="Filtering candidates",
+            )
+        )
+    models: list[ModelInfo] = [m for m, keep in zip(candidates, keep_flags) if keep]
     print(f"Kept {len(models)} {label} models after filtering.")
 
     models = models[:limit]
-    print(f"Writing top {len(models)} to {output_csv}")
 
     base_head: list[str] = [
         "rank",
@@ -251,51 +399,71 @@ def build_catalog(
         "parameters (str)",
         "parameters",
         "library",
-        "is_gated",
-        "is_moe",
+        # "is_gated",
+        # "is_moe",
     ]
     extra_head: list[str] = [h for h, _ in extra_columns]
     tail_head: list[str] = ["is_custom_code", "config_class", "is_supported", "Year"]
+    header: list[str] = base_head + extra_head + tail_head
 
-    with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(base_head + extra_head + tail_head)
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        config_classes: list[str | None] = list(
+            tqdm(
+                ex.map(lambda m: get_config_type(m.id, token), models),
+                total=len(models),
+                desc="Fetching config classes",
+            )
+        )
 
-        with ThreadPoolExecutor(max_workers=16) as ex:
-            config_classes: list[str | None] = list(
-                tqdm(
-                    ex.map(lambda m: get_config_type(m.id, token), models),
-                    total=len(models),
-                    desc="Fetching config classes",
+    rows: list[dict[str, object]] = []
+    for rank, (m, config_class) in enumerate(zip(models, config_classes), start=1):
+        architectures: list[str] | None = (m.config or {}).get("architectures")
+        arch_str: str | None = ";".join(architectures) if architectures else None
+        param_str, param_int = _resolve_param_columns(m, allow_millions)
+        extra_vals: list[object] = [fn(m, config_class) for _, fn in extra_columns]
+        rows.append(
+            dict(
+                zip(
+                    header,
+                    [
+                        rank,
+                        m.id,
+                        m.downloads,
+                        m.likes,
+                        (m.config or {}).get("model_type"),
+                        arch_str,
+                        param_str,
+                        param_int,
+                        m.library_name,
+                        # bool(m.gated),
+                        # is_moe(m),
+                        *extra_vals,
+                        is_custom_code(m),
+                        config_class,
+                        is_supported_config(config_class),
+                        m.created_at.year if m.created_at else None,
+                    ],
                 )
             )
+        )
 
-        for rank, (m, config_class) in enumerate(zip(models, config_classes), start=1):
-            architectures: list[str] | None = (m.config or {}).get("architectures")
-            arch_str: str | None = ";".join(architectures) if architectures else None
-            param_str, param_int = _resolve_param_columns(m, allow_millions)
-            extra_vals: list[object] = [fn(m, config_class) for _, fn in extra_columns]
-            writer.writerow(
-                [
-                    rank,
-                    m.id,
-                    m.downloads,
-                    m.likes,
-                    (m.config or {}).get("model_type"),
-                    arch_str,
-                    param_str,
-                    param_int,
-                    m.library_name,
-                    bool(m.gated),
-                    is_moe(m),
-                    *extra_vals,
-                    is_custom_code(m),
-                    config_class,
-                    is_supported_config(config_class),
-                    m.created_at.year if m.created_at else None,
-                ]
-            )
+    if output_csv is not None:
+        print(f"Writing top {len(rows)} to {output_csv}")
+        with open(output_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=header)
+            writer.writeheader()
+            writer.writerows(rows)
 
-    print(f"Done. Top 5 {label} models:")
-    for i, m in enumerate(models[:5], start=1):
-        print(f"  {i}. {m.id} — {m.downloads:,} downloads")
+    # Attach the source ModelInfo to each row AFTER the CSV write. It is a
+    # runtime-only field (not serializable, and never part of the schema),
+    # useful for callers that need metadata the row dict does not expose —
+    # e.g. safetensors.parameters, gated, sha, siblings.
+    #
+    # is_moe is precomputed here (a pure function of data already fetched —
+    # tags, config.model_type, config.architectures) so callers that need it
+    # don't have to carry the non-serializable ModelInfo object forward.
+    for row, m in zip(rows, models):
+        row["model_info"] = m
+        row["is_moe"] = is_moe(m)
+
+    return rows
