@@ -128,18 +128,17 @@ jobs:
     outputs:
       test_type: ${{ steps.resolve.outputs.test_type }}
     steps:
+      - name: Checkout (for the shared resolver script)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: scripts/resolve_test_type.sh
+          sparse-checkout-cone-mode: false
       - name: Resolve
         id: resolve
         env:
           RAW_TEST_TYPE: ${{ inputs.test_type }}
         run: |
-          case "${RAW_TEST_TYPE}" in
-            unit)        RESOLVED=core ;;
-            integration) RESOLVED=smoke ;;
-            regression)  RESOLVED=full ;;
-            '')          RESOLVED=full ;;
-            *)           RESOLVED="${RAW_TEST_TYPE}" ;;
-          esac
+          RESOLVED="$(scripts/resolve_test_type.sh ${RAW_TEST_TYPE})"
           echo "test_type=${RESOLVED}" >> "${GITHUB_OUTPUT}"
 
   pre-commit:

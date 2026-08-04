@@ -111,20 +111,11 @@ model-module-tests: ## Run oot_framework module tests (suite key: model_module; 
 # the whole directory in one ClickHouse push. One failing suite doesn't skip the
 # rest; the aggregate's exit code still reflects any failure.
 tests: ## Run the suites selected by TEST_TYPE into RESULTS_DIR (JUnit per suite)
-	@# Resolve the user-facing tier aliases (unit/integration/regression) to this
-	@# Makefile's own vocabulary once, up front -- same mapping as _test_matrix.yaml's
-	@# resolve-test-type job, so `make tests TEST_TYPE=unit` matches what CI runs for
-	@# the "unit" tier via GHA.
-	resolved=""; \
-	for t in $(TEST_TYPE); do \
-	  case "$$t" in \
-	    unit)        resolved="$$resolved core" ;; \
-	    integration) resolved="$$resolved smoke" ;; \
-	    regression)  resolved="$$resolved full" ;; \
-	    *)           resolved="$$resolved $$t" ;; \
-	  esac; \
-	done; \
-	resolved="$${resolved# }"; \
+	@# Resolve the user-facing tier aliases (unit/integration/regression) via the
+	@# shared script -- same source of truth as _test_matrix.yaml's
+	@# resolve-test-type job, so `make tests TEST_TYPE=unit` matches what CI runs
+	@# for the "unit" tier via GHA.
+	resolved="$$(scripts/resolve_test_type.sh $(TEST_TYPE))"; \
 	case " $$resolved " in \
 	  *" full "*) suites="adapter_coverage smoke load token_compare embed_compare vlm model_module" ;; \
 	  *" core "*) suites="adapter_coverage load token_compare embed_compare vlm model_module" ;; \
