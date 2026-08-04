@@ -5,12 +5,13 @@ SHELL := /bin/bash
 # product repos: torch-spyre, hf-adapters, spyre-inference):
 #   smoke — fast per-op unit tests only
 #   core  — all spyre-native tests (excludes the heavy upstream suites)
-#   full  — everything (default)
+#   full  — everything
 # Also accepts the user-facing tier aliases unit (= core), integration (= smoke),
 # regression (= full) -- same mapping as _test_matrix.yaml's resolve-test-type job.
 # Also accepts a space-separated list of individual suite keys (matches
 # _test_matrix.yaml's `test_type` semantics), e.g. TEST_TYPE="smoke load".
-TEST_TYPE ?= full
+# Empty / unset defaults to "regression" (= full: every suite).
+TEST_TYPE ?= regression
 
 # MODEL_KEY narrows a suite to one model via pytest's -k filter (matrix-style
 # per-model CI jobs pass this); empty = run every model in the suite.
@@ -46,7 +47,7 @@ endif
 help: ## Show this help message
 	@awk 'BEGIN {FS = ":.*?## "} /^[0-9a-zA-Z_-]+:.*?## / {printf "\033[36m%-24s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo ""
-	@echo "Variables: TEST_TYPE=smoke|core|full|unit|integration|regression|<space-separated suite keys> (default full),"
+	@echo "Variables: TEST_TYPE=smoke|core|full|unit|integration|regression|<space-separated suite keys> (default regression),"
 	@echo "  MODEL_KEY (pytest -k filter, default all), PYTEST_ARGS (default '$(PYTEST_ARGS)'),"
 	@echo "  JUNIT_XML (single-suite targets only), RESULTS_DIR (default '$(RESULTS_DIR)')"
 
