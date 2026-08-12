@@ -110,6 +110,11 @@ jobs:
   # inline there -- the previous `github.event_name == 'pull_request' && ...` form
   # was always false in the queue, so every suite below re-ran on a commit whose
   # testing the label had already handed to the Jenkins integration run.
+  #
+  # Every gated suite `needs` this job, so a FAILURE here would skip all of them
+  # regardless of their own `if:` -- which is why it is also listed in
+  # run-spyre-unit-tests' failure predicates below: the required check then goes red
+  # rather than reporting a false green over suites that never ran.
   detect-label:
     name: Detect integration-test label
     runs-on: ubuntu-latest
@@ -760,7 +765,8 @@ jobs:
         #   contains(needs.<job>.result, 'failure') || contains(needs.<job>.result, 'cancelled') ||
         # lines when restoring either job.
         run: |-
-          if ${{ contains(needs.pre-commit.result, 'failure') || contains(needs.pre-commit.result, 'cancelled') ||
+          if ${{ contains(needs.detect-label.result, 'failure') || contains(needs.detect-label.result, 'cancelled') ||
+                 contains(needs.pre-commit.result, 'failure') || contains(needs.pre-commit.result, 'cancelled') ||
                  contains(needs.mypy.result, 'failure') || contains(needs.mypy.result, 'cancelled') ||
                  contains(needs.generate-matrix.result, 'failure') || contains(needs.generate-matrix.result, 'cancelled') ||
                  contains(needs.adapter-coverage.result, 'failure') || contains(needs.adapter-coverage.result, 'cancelled') ||
