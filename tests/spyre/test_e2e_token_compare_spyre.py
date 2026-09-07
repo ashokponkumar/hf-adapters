@@ -136,20 +136,27 @@ def adapter_greedy_steps(
 
     results = []
 
-    prefill_mask = build_prefill_mask(
-        batch_size, padded_len, prefill_cache_len, prompt_offset, dtype=dtype
-    )
-
+    query_chunk_size = prefill_chunk_size or padded_len
     with torch.no_grad():
-        logits = run_forward_fn(
-            model,
-            padded_ids.to(DEVICE),
-            position_ids.to(DEVICE),
-            prefill_mask.to(DEVICE),
-            prefill_key_caches,
-            prefill_value_caches,
-            cache_index=make_cache_index(0, padded_len, DEVICE),
-        )
+        for chunk_start in range(0, padded_len, query_chunk_size):
+            chunk_end = chunk_start + query_chunk_size
+            prefill_mask = build_prefill_mask(
+                batch_size,
+                query_chunk_size,
+                prefill_cache_len,
+                prompt_offset,
+                dtype=dtype,
+                query_start=chunk_start,
+            )
+            logits = run_forward_fn(
+                model,
+                padded_ids[:, chunk_start:chunk_end].to(DEVICE),
+                position_ids[:, chunk_start:chunk_end].to(DEVICE),
+                prefill_mask.to(DEVICE),
+                prefill_key_caches,
+                prefill_value_caches,
+                cache_index=make_cache_index(chunk_start, query_chunk_size, DEVICE),
+            )
     logits_cpu = logits.to("cpu")[0, -1, :].float()[:vocab_size]
     token = logits_cpu.argmax().item()
     results.append({"logits": logits_cpu, "token": token, "step": 0})
