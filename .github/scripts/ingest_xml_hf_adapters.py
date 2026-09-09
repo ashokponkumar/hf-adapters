@@ -20,14 +20,13 @@ import argparse
 import os
 import platform as _platform
 import sys
-
-import v2_schema
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 import clickhouse_connect
+import v2_schema
 from lxml import etree
 
 # ---------------------------------------------------------------------------
@@ -561,6 +560,8 @@ def insert_v2(client, component: str, run_id: str, cases: list) -> int:
             file=sys.stderr,
         )
     return len(run_rows)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml-dir", default=None)
