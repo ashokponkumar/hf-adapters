@@ -3,12 +3,12 @@ built, so pair equality against the pre-refactor output is a complete correctnes
 
 import pytest
 from v2_schema import (
-    BENCHMARKS,
     BENCHMARK_RUNS,
-    TEST_CASES,
-    TEST_CASE_RUNS,
-    TABLES,
+    BENCHMARKS,
     STATUS_VALUES,
+    TABLES,
+    TEST_CASE_RUNS,
+    TEST_CASES,
     SchemaError,
     insert,
     insert_identities,
