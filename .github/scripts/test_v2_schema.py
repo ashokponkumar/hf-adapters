@@ -1,5 +1,6 @@
 """Pins the insert layer's contract. The model only changes HOW a (column_names, row) pair is
-built, so pair equality against the pre-refactor output is a complete correctness proof."""
+built, so pair equality against the pre-refactor output is a complete correctness proof.
+"""
 
 import pytest
 from v2_schema import (
