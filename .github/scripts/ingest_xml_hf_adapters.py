@@ -431,7 +431,12 @@ def v2_test_case_id(component: str, classname: str, name: str, tags) -> str:
         uuid.uuid5(
             V2_NAMESPACE,
             V2_SEP.join(
-                (_v2_norm(component), _v2_norm(classname), _v2_norm(name), ",".join(norm))
+                (
+                    _v2_norm(component),
+                    _v2_norm(classname),
+                    _v2_norm(name),
+                    ",".join(norm),
+                )
             ),
         )
     )
@@ -645,16 +650,17 @@ def main():
     # CLICKHOUSE_DB_V2 is unset, which every v2 site treats as "v2 not configured".
     v2client = get_v2_client() if args.write_v2 else None
     if args.write_v2 and v2client is None:
-        print("  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
-              file=sys.stderr)
+        print(
+            "  WARN --schema asked for v2 but CLICKHOUSE_DB_V2 is unset — v2 rows skipped",
+            file=sys.stderr,
+        )
     client.command("SELECT 1")
     print("Connected.\n")
 
     db = os.environ.get("CLICKHOUSE_DB", "spyre")
     if not tables_exist(client, db):
         print(
-            f"{db}.hf_test_runs does not exist — nothing to ingest into. "
-            "Silent no-op."
+            f"{db}.hf_test_runs does not exist — nothing to ingest into. Silent no-op."
         )
         sys.exit(0)
 
@@ -746,7 +752,9 @@ def main():
                     _n = insert_v2(v2client, V2_COMPONENT, _v2_run_id, cases)
                     print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
         except Exception as _v2_err:
-            print(f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}", file=sys.stderr)
+            print(
+                f"  [warn] v2 write failed, v1 unaffected: {_v2_err!r}", file=sys.stderr
+            )
 
         total_cases += len(cases)
         if args.write_v1:
