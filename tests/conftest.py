@@ -45,6 +45,7 @@ import importlib.util
 import os
 import sys
 import types
+import warnings
 from typing import Any, Union
 
 import pytest
@@ -144,10 +145,6 @@ from hf_adapters.auto_spyre_model import (  # noqa: E402
     resolve_adapter_module,
 )
 
-# Sibling module, stdlib-only: it touches neither hf_adapters nor torch, so it is
-# unaffected by the DEVICE patching above and safe to import here.
-from tests._tier_tags import result_tags as _result_tags  # noqa: E402
-
 
 def encode_generation_inputs(tokenizer: Any, prompts: list[str]):
     """Tokenize canonically, using right padding to exercise input normalization."""
@@ -207,11 +204,28 @@ def _emit_result_tags(request, record_property):
     for an artifact, so a run must record every tier its suite BELONGS to (from
     ``--suite`` via tests/_tier_tags.py), not the one that invoked it. Autouse because
     the tags describe every case, not an opt-in subset.
+
+    Imported inside the fixture and wrapped: tagging is REPORTING, so it must never be
+    able to fail a test run. At conftest module scope a bad import aborts collection for
+    the whole suite, and pytest then reports the first failing import in the chain --
+    which can look like an unrelated dependency error rather than this one.
     """
-    params = getattr(getattr(request.node, "callspec", None), "params", {})
     suite = request.config.getoption("--suite")
-    for name, value in _result_tags(suite, params):
-        record_property(name, value)
+    if not suite:
+        return
+    try:
+        from tests._tier_tags import result_tags
+    except Exception as exc:  # pragma: no cover - defensive
+        warnings.warn(
+            f"result tags unavailable, tests run untagged: {exc!r}", stacklevel=1
+        )
+        return
+    params = getattr(getattr(request.node, "callspec", None), "params", {})
+    try:
+        for name, value in result_tags(suite, params):
+            record_property(name, value)
+    except Exception as exc:  # pragma: no cover - defensive
+        warnings.warn(f"could not stamp result tags: {exc!r}", stacklevel=1)
 
 
 def pytest_generate_tests(metafunc: Metafunc) -> None:
