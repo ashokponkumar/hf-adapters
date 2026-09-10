@@ -144,6 +144,10 @@ from hf_adapters.auto_spyre_model import (  # noqa: E402
     resolve_adapter_module,
 )
 
+# Sibling module, stdlib-only: it touches neither hf_adapters nor torch, so it is
+# unaffected by the DEVICE patching above and safe to import here.
+from tests._tier_tags import result_tags as _result_tags  # noqa: E402
+
 
 def encode_generation_inputs(tokenizer: Any, prompts: list[str]):
     """Tokenize canonically, using right padding to exercise input normalization."""
@@ -182,6 +186,32 @@ def pytest_addoption(parser: Parser) -> None:
             "in the test decorators are ignored."
         ),
     )
+    parser.addoption(
+        "--suite",
+        default="",
+        help=(
+            "Suite key this run belongs to (e.g. ``smoke``, ``token_compare``), used "
+            "only to stamp the JUnit ``testtype__<tier>`` tags the CI/CD warehouse "
+            "reads. Each Makefile suite target passes its own key; see "
+            "tests/_tier_tags.py for the suite -> tier table. Unset means no tier "
+            "tag, which costs reuse data but never fails a run."
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _emit_result_tags(request, record_property):
+    """Stamp each test's ``testtype__<tier>`` / ``model__<id>`` JUnit tags.
+
+    The CI/CD warehouse reads these to decide whether a tier's coverage already exists
+    for an artifact, so a run must record every tier its suite BELONGS to (from
+    ``--suite`` via tests/_tier_tags.py), not the one that invoked it. Autouse because
+    the tags describe every case, not an opt-in subset.
+    """
+    params = getattr(getattr(request.node, "callspec", None), "params", {})
+    suite = request.config.getoption("--suite")
+    for name, value in _result_tags(suite, params):
+        record_property(name, value)
 
 
 def pytest_generate_tests(metafunc: Metafunc) -> None:
