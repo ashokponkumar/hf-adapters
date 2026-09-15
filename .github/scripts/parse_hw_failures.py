@@ -29,11 +29,12 @@ Please note:
 
 import argparse
 import json
-import regex as re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import regex as re
 
 # ----------------------------
 # Regex patterns
