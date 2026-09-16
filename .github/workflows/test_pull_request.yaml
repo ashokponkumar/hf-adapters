@@ -98,6 +98,12 @@ jobs:
     with:
       # Per-PR ephemeral image label when provided, else the standing set for this event.
       image_label: ${{ inputs.runner_label || 'image_torch_spyre' }}
+      # runner_label is only ever set by the Jenkins-driven /spyre-test dispatch,
+      # which selects a per-PR image already built from this exact ref/repository
+      # -- trust its baked-in torch-spyre instead of re-resolving/pinning. Native
+      # push/pull_request runs (runner_label empty) land on the standing image, so
+      # keep pinning origin/main for those.
+      prebaked_image: ${{ inputs.runner_label != '' }}
       extra_test_flags: -vvv -s
       extra_test_flags_multi_spyre: -vvv -s
       ref: ${{ inputs.ref || '' }}
