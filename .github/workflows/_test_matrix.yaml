@@ -117,6 +117,15 @@ on:
         required: false
         type: boolean
         default: false
+      run_id:
+        description: >
+          UUID identifying this TEST RUN, threaded from the dispatching orchestrator. Uploaded
+          as the `run-id` artifact below so push-test-results-to-clickhouse.yaml -- which runs
+          on workflow_run AFTER this workflow and therefore cannot receive a dispatch input --
+          can recover it and stamp test_case_runs with the same id artifact_results carries.
+        required: false
+        type: string
+        default: ''
       prebaked_image:
         description: >-
           When true, run every suite on the torch-spyre that is ALREADY baked
@@ -202,6 +211,25 @@ jobs:
         run: |
           RESOLVED="$(scripts/resolve_test_type.sh ${RAW_TEST_TYPE})"
           echo "test_type=${RESOLVED}" >> "${GITHUB_OUTPUT}"
+
+      # The threaded run_id has to reach push-test-results-to-clickhouse.yaml, which runs on
+      # workflow_run AFTER this workflow and so cannot take a dispatch input. An artifact is
+      # the channel that ingest ALREADY reads (it enumerates this run's artifacts to find the
+      # junit XML), so the uuid rides it rather than needing a new transport or a uuid stuffed
+      # into the user-facing run-name. Skipped when empty so a GHA-initiated run uploads
+      # nothing and the ingest derives its own id, exactly as before.
+      - name: Record threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # Resolve the torch-spyre revision ONCE per run and pin it (issue #449).
