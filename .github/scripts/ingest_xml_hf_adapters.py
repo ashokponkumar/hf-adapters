@@ -369,7 +369,19 @@ def _threaded_run_id(args) -> str:
 # The product this script ingests for. Replaces v1's hf_/si_ table-name prefixes: one
 # v2 table pair serves all three products, discriminated by this column. It is also a
 # test_case_id hash input, so it cannot drift from the identity it is stamped on.
-V2_COMPONENT = "hf-adapters"
+# The product this script ingests for by DEFAULT. A default, not a constant: a test cell may
+# run ANOTHER component's suite through this script, and hardcoding the owner stamps those rows
+# with the wrong component. Because component is a test_case_id hash input, that does not merely
+# mislabel -- the same test reconciles to a DIFFERENT identity depending on whose script ran it,
+# splitting one suite across two components. --component lets the caller name the suite's real
+# owner; product-test already knows it (config.yaml's PRODUCT).
+V2_COMPONENT_DEFAULT = "hf-adapters"
+
+
+def v2_component(args) -> str:
+    """The component to stamp on v2 rows: --component when given, else this repo's default."""
+    return (getattr(args, "component", "") or "").strip() or V2_COMPONENT_DEFAULT
+
 
 V2_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_DNS, "clickhouse-v2.spyre.ibm.com")
 V2_SEP = "|"
@@ -602,7 +614,18 @@ def insert_v2(
                 "fail_message": (c.get("fail_message") or "")[:8192],
                 # Names the xml this row came from, so a sharded run dedups per
                 # file instead of the first shard blocking the rest.
-                "props": ({"source_file": source_file} if source_file else {}),
+                # ran_in names the run that ACTUALLY EXECUTED this case -- for a case this
+                # run ran, that is this run_id. It is stamped on EXECUTED rows because it is
+                # the base case a reuse copy preserves: a copy of a copy must still name the
+                # real executor, so without it the value would degrade one hop per reuse.
+                # "How much did we execute" therefore filters props['ran_in'] = run_id
+                # uniformly on every row, with no absent-key special case to forget.
+                "props": (
+                    {
+                        "ran_in": run_id,
+                        **({"source_file": source_file} if source_file else {}),
+                    }
+                ),
             }
         )
     # Cross-run dedup, not just in-leg: test_cases is a plain MergeTree, so re-inserting a
@@ -625,6 +648,13 @@ def main():
     parser.add_argument("--branch", default="")
     parser.add_argument("--sha", default="")
     parser.add_argument("--run-id", default="")
+    parser.add_argument(
+        "--component",
+        default="",
+        help="Component to stamp on v2 rows. Defaults to this repo's own product; set it "
+        "when a cell runs ANOTHER component's suite through this script, so the rows (and "
+        "the test_case_id they hash into) name the suite's real owner.",
+    )
     parser.add_argument("--gha-run-id", default="")
     parser.add_argument("--triggered-at", default="")
     parser.add_argument("--pr-number", default="")
@@ -798,12 +828,17 @@ def main():
                         file=sys.stderr,
                     )
                 elif v2_already_ingested(
-                    client, v2db, _v2_run_id, V2_COMPONENT, xml_path.name
+                    client, v2db, _v2_run_id, v2_component(args), xml_path.name
                 ):
                     print(f"  v2: already ingested run_id={_v2_run_id} — skipping")
                 else:
                     _n = insert_v2(
-                        client, v2db, V2_COMPONENT, _v2_run_id, cases, xml_path.name
+                        client,
+                        v2db,
+                        v2_component(args),
+                        _v2_run_id,
+                        cases,
+                        xml_path.name,
                     )
                     print(f"  v2: {_n} test_case_runs under run_id={_v2_run_id}")
         except Exception as _v2_err:
