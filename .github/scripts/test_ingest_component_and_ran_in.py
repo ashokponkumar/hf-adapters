@@ -110,3 +110,38 @@ def test_ran_in_is_present_even_without_a_source_file():
     rows = _one_run_row(source_file="")
     assert rows and all(r["props"]["ran_in"] == RID for r in rows)
     assert all("source_file" not in r["props"] for r in rows)
+
+
+def test_ingest_uses_the_shared_library_not_a_local_copy():
+    # The point of extensions/clickhouse-ingest is that ONE definition runs. A local copy that
+    # merely agrees today passes every value-based test while drifting silently, so assert
+    # object identity: editing the library must change what this ingest executes.
+    import spyre_clickhouse_ingest as lib
+
+    module = _load()
+    for name in (
+        "extract_properties",
+        "get_client",
+        "insert_v2",
+        "promote_xpass",
+        "v2_already_ingested",
+        "v2_component",
+        "v2_database",
+        "v2_run_id_for",
+        "v2_source_and_external_run_id",
+        "v2_tables_present",
+    ):
+        assert getattr(module, name) is getattr(lib, name), name
+
+
+def test_component_default_is_hf_not_the_library_default():
+    # v2_component takes the default as a PARAMETER precisely so this repo stamps itself.
+    # `component` hashes into test_case_id, so falling back to the library's own default would
+    # mint torch-spyre identities for hf rows -- a wrong identity, not a mislabel.
+    import spyre_clickhouse_ingest as lib
+
+    module = _load()
+    assert module.V2_COMPONENT_DEFAULT == "hf-adapters"
+    args = _Args(component="")
+    assert lib.v2_component(args, module.V2_COMPONENT_DEFAULT) == "hf-adapters"
+    assert lib.v2_component(args) != "hf-adapters"
