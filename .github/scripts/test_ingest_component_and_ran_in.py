@@ -44,28 +44,38 @@ class _FakeClient:
 
 
 def test_component_defaults_to_this_repos_product():
-    assert _load().v2_component(_Args(component="")) == "hf-adapters"
+    assert (lambda m: m.v2_component(_Args(component=""), m.V2_COMPONENT_DEFAULT))(
+        _load()
+    ) == "hf-adapters"
 
 
 def test_component_honours_an_explicit_override():
-    assert _load().v2_component(_Args(component="torch-spyre")) == "torch-spyre"
+    assert (
+        lambda m: m.v2_component(_Args(component="torch-spyre"), m.V2_COMPONENT_DEFAULT)
+    )(_load()) == "torch-spyre"
 
 
 def test_component_treats_blank_as_absent():
-    assert _load().v2_component(_Args(component="   ")) == "hf-adapters"
+    assert (lambda m: m.v2_component(_Args(component="   "), m.V2_COMPONENT_DEFAULT))(
+        _load()
+    ) == "hf-adapters"
 
 
 def test_component_survives_a_caller_that_passes_no_flag():
     # An older caller's Namespace has no `component` attribute; falling back keeps the ingest
     # working while callers are updated, rather than raising.
-    assert _load().v2_component(_Args()) == "hf-adapters"
+    assert (lambda m: m.v2_component(_Args(), m.V2_COMPONENT_DEFAULT))(
+        _load()
+    ) == "hf-adapters"
 
 
 def test_component_changes_test_case_identity():
     # Why a wrong stamp is not merely a mislabel: component is a test_case_id hash input.
-    m = _load()
-    a = m.v2_test_case_id("hf-adapters", "T", "test_x", [])
-    b = m.v2_test_case_id("torch-spyre", "T", "test_x", [])
+    # Imported from the library, which the ingest now uses rather than a local copy.
+    from spyre_clickhouse_ingest import v2_test_case_id
+
+    a = v2_test_case_id("hf-adapters", "T", "test_x", [])
+    b = v2_test_case_id("torch-spyre", "T", "test_x", [])
     assert a and b and a != b
 
 
