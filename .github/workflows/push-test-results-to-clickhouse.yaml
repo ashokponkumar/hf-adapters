@@ -207,6 +207,16 @@ jobs:
           echo "Resolved tier: ${TIER:-<none>}"
           echo "tier=${TIER}" >> "${GITHUB_OUTPUT}"
 
+      # The orchestrator's uuid, stashed as the "run-id" artifact by the dispatched run.
+      # This workflow triggers on workflow_run, so it cannot receive that as an input.
+      # Empty on a GHA-initiated run => the ingest derives its own id from the coordinate.
+      - name: Recover threaded run_id
+        id: threaded-run-id
+        uses: torch-spyre/torch-spyre/.github/actions/recover-threaded-run-id@main
+        with:
+          triggering-run-id: ${{ env.TRIGGERING_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
       # ---------------------------------------------------------------------------
       # Parse each XML file and insert rows into ClickHouse via
       # ingest_xml_hf_adapters.py (checked out above), into
@@ -221,6 +231,7 @@ jobs:
             --branch   "${TRIGGERING_BRANCH}" \
             --sha      "${TRIGGERING_SHA}" \
             --gha-run-id "${TRIGGERING_RUN_ID}" \
+            --run-id "${{ steps.threaded-run-id.outputs.run_id }}" \
             --triggered-at "${TRIGGERING_AT}" \
             --pr-number    "${{ steps.resolve-pr.outputs.pr_number }}" \
             --trigger-type "${{ steps.extract-tier.outputs.tier }}" \

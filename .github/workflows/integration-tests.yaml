@@ -109,6 +109,18 @@ on:
         required: false
         type: string
         default: ''
+      run_id:
+        description: >-
+          The orchestrator's uuid for this test run, threaded from
+          spyre-frameworks so the ClickHouse ingest stamps its rows with the
+          same id the Jenkins-side artifact_results writer recorded, and the
+          two join on one identity instead of each hashing its own coordinate.
+          Empty on a GHA-initiated run => the ingest derives its own.
+          Declared here because a dispatch input this workflow does not declare
+          is dropped by the dispatcher (run_integration_tests.py map_inputs).
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   # PR-context runs (native pull_request, or workflow_dispatch carrying a
@@ -157,6 +169,23 @@ jobs:
             echo "| PR URL hash     | ${{ inputs.pr_url_hash || '(not specified)' }} |"
             echo "| hf-adapters ref | ${{ inputs.ref || github.sha }} |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The ingest runs on workflow_run and so sees none of this run's inputs. Passing the
+      # threaded uuid through an artifact is the only channel between the two, and it is why
+      # push-test-results-to-clickhouse.yaml can recover it at all.
+      - name: Stash threaded run_id for the ingest
+        if: ${{ inputs.run_id != '' }}
+        env:
+          THREADED_RUN_ID: ${{ inputs.run_id }}
+        run: printf '%s' "${THREADED_RUN_ID}" > run-id.txt
+
+      - name: Upload threaded run_id
+        if: ${{ inputs.run_id != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: run-id
+          path: run-id.txt
+          retention-days: 1
 
   # ---------------------------------------------------------------------------
   # Read tests/model_lists/integration.yaml and emit a space-separated model
