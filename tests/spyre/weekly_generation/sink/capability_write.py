@@ -24,11 +24,12 @@ shards per tier, each its own process with its own client, so each stamps ``prop
 and the dedup guard scopes on it: keyed on the run alone, the first shard to flush would make
 every other shard look already-ingested and its verdicts would be dropped with no error.
 
-NOT YET DECLARED AS A DEPENDENCY. ``spyre-clickhouse-ingest`` lives in torch-spyre's
-``extensions/clickhouse-ingest``, which does not exist on its ``main`` branch yet -- so adding
-it to ``pyproject.toml`` makes ``uv lock`` fail outright. The import is therefore deliberately
-INSIDE ``write()``, and the caller treats ImportError like any other v2 failure: the scan logs
-it and keeps its v1 rows. Declare the dependency and re-lock once that library has merged.
+INSTALLED PER JOB, NOT DECLARED IN ``pyproject.toml``. ``build-hf-adapters`` runs
+``uv sync --frozen``, so a manifest entry would need a lock entry and would pin the library to
+a locked commit -- a fix there would then need an hf-adapters re-lock to take effect. The
+workflow installs it as a step instead (see ``CH_INGEST_LIB``), which is also how
+spyre-inference's ingest gets it. The import is therefore INSIDE ``write()`` and the caller
+treats an ImportError like any other v2 failure: the scan logs it and keeps its v1 rows.
 """
 
 from __future__ import annotations
