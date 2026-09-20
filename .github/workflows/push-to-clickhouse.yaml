@@ -112,6 +112,10 @@ env:
   CLICKHOUSE_USER: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_USER_DEV || secrets.CLICKHOUSE_USER }}
   CLICKHOUSE_PASS: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_PASS_DEV || secrets.CLICKHOUSE_PASS }}
   CLICKHOUSE_DB: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_DB_DEV || secrets.CLICKHOUSE_DB }}
+  # The schema-v2 database, which the scan dual-writes capability rows to alongside every v1
+  # insert. Unset is a no-op, not a failure: v1 is what this scan exists to produce, so a
+  # deployment without v2 tables writes v1 exactly as before. v1 and v2 never share a database.
+  CLICKHOUSE_DB_V2: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_DB_V2_DEV || secrets.CLICKHOUSE_DB_V2 }}
 
 jobs:
   # ---------------------------------------------------------------------------
