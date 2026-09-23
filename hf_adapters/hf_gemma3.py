@@ -35,12 +35,14 @@ its own compiled block rather than ``make_standard_gqa_block``:
   (on the *MLP output* before the residual add).
 - **Unit-offset RMSNorm.** ``Gemma3RMSNorm`` scales by ``(1.0 + weight)`` (weights
   stored centered at 0) and is *always* scaled (no ``with_scale=False`` V-norm).
-  This is the one substantive numeric difference from ``hf_common.patch_rmsnorm``.
+  This unit-offset form is why Gemma keeps its own ``_patch_gemma3_rmsnorm`` rather
+  than relying on stock HF RMSNorm (which standard adapters do post-PR-#2927).
 - **Scaled attention via ``query_pre_attn_scalar``.** ``scaling ==
   query_pre_attn_scalar ** -0.5``, which is NOT ``head_dim ** -0.5`` in general
   (e.g. 27B: ``head_dim=128`` but ``query_pre_attn_scalar=168``). Captured from
   ``attn.scaling`` so the per-checkpoint value is used.
-- **Large vocab.** 262K vocab → chunked LM head (like ``hf_gemma4`` / ``hf_phi3``).
+- **Large vocab.** 262K vocab → stick-padded LM head (like ``hf_gemma4`` /
+  ``hf_phi3``).
   ``final_logit_softcapping`` is ``None`` on published Gemma 3 (dropped from
   Gemma 2); the cap is applied only if a checkpoint sets it.
 
@@ -58,7 +60,8 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("google/gemma-3-1b-it")
     tokenizer = AutoTokenizer.from_pretrained("google/gemma-3-1b-it")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
@@ -71,23 +74,38 @@ from hf_adapters.hf_common import (
     apply_rope_matmul,
     get_backbone,
     kv_cache_update,
-    pad_lm_head,
+    prepare_lm_head_for_spyre,
+    run_lm_head,
     text_config,
+)
+from hf_adapters.swa_attention import (
+    SlidingWindowCache,
+    allocate_swa_caches,
+    anchored_step,
+    compact_sliding_buffers,
+    fit_attention_mask,
+    physical_cache_capacity,
+    prefill_ring_step,
+    roll_sliding_buffers,
+    sliding_window_attention,
+    valid_start_for,
 )
 
 
-def _patch_gemma3_rmsnorm(rmsnorm_cls):
-    """Patch a Gemma3 ``RMSNorm`` class to stay in fp16 on Spyre.
+def _patch_gemma_rmsnorm(rmsnorm_cls):
+    """Patch a Gemma 2/3 unit-offset ``RMSNorm`` class for Spyre.
 
-    Mirrors ``hf_common.patch_rmsnorm`` but for Gemma3's RMSNorm, which:
+    Unlike standard adapters (which leave RMSNorm as stock HF now that PR #2927
+    lowers the fp32-upcast pattern), Gemma2/3's RMSNorm needs a dedicated patch
+    because it:
       - uses ``self.eps`` (not ``variance_epsilon``),
       - is **unit-offset**: scales by ``(1.0 + weight)`` rather than ``weight``
         (Gemma stores norm weights centered at 0),
       - is always scaled (no scale-free variant — there is no V-norm).
 
-    On Spyre we stay in fp16; on CPU we upcast to fp32 to match stock HF, whose
-    ``Gemma3RMSNorm`` computes the norm and the ``(1.0 + weight)`` multiply in
-    fp32 before casting back.
+    On Spyre we keep the reduction at input dtype; on CPU we upcast to fp32 to
+    match stock HF, whose Gemma RMSNorm computes the norm and the
+    ``(1.0 + weight)`` multiply in fp32 before casting back.
     """
 
     def _forward_fp16(self, hidden_states):
@@ -105,20 +123,34 @@ def _patch_gemma3_rmsnorm(rmsnorm_cls):
     rmsnorm_cls.forward = _forward_fp16
 
 
-def _make_compiled_block(layer, num_q_heads, num_kv_heads, head_dim):
+def _make_compiled_block(
+    layer,
+    num_q_heads,
+    num_kv_heads,
+    head_dim,
+    is_sliding=False,
+    window_size=None,
+    swa_mode=None,
+):
     """Compile one Gemma 3 dense decoder layer.
 
     Block signature carries the per-layer mask and RoPE freqs (which differ
     between sliding and global layers), so the caller selects them:
 
         block_forward(hidden_states, selected_freqs, attn_mask,
-                      key_cache, value_cache,
-                      cache_index)
+                      key_cache, value_cache, cache_index)
             -> (hidden_states, key_cache, value_cache)
 
     Gemma applies Q/K RMSNorm before RoPE and uses the four-norm "sandwich"
     structure. Attention is scaled by ``query_pre_attn_scalar ** -0.5`` (captured
     from ``attn.scaling``), which is not ``head_dim ** -0.5`` in general.
+
+    When ``is_sliding`` and ``swa_mode`` is set, the sliding layer reads its window
+    out of a compact KV buffer via ``spyre::sliding_window_attention`` instead of
+    scoring the whole cache behind a band mask. Prefill and anchored decode pass
+    the same fixed-shape tensor-mask API, so positions do not specialize the graph
+    (see ``swa_attention``). Global layers, and every layer when ``swa_mode is
+    None``, stay on band-masked SDPA.
     """
     attn = layer.self_attn
     q_proj = attn.q_proj
@@ -170,15 +202,29 @@ def _make_compiled_block(layer, num_q_heads, num_kv_heads, head_dim):
             cache_index,
         )
 
-        attn_out = F.scaled_dot_product_attention(
-            q,
-            key_cache,
-            value_cache,
-            attn_mask=attn_mask,
-            dropout_p=0.0,
-            scale=scaling,
-            enable_gqa=True,
-        )
+        if is_sliding and swa_mode is not None:
+            # The mask carries the window, cache position, and padding as tensor
+            # data. Scale is Gemma 3's own query_pre_attn_scalar ** -0.5, not
+            # head_dim ** -0.5.
+            attn_out = sliding_window_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask,
+                window_size=window_size,
+                is_causal=True,
+                scale=scaling,
+            )
+        else:
+            attn_out = F.scaled_dot_product_attention(
+                q,
+                key_cache,
+                value_cache,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                scale=scaling,
+                enable_gqa=True,
+            )
         attn_out = attn_out.transpose(1, 2).reshape(bsz, seq_len, -1)
         attn_out = o_proj(attn_out)
         # Sandwich: norm the attention output BEFORE adding the residual.
@@ -274,22 +320,29 @@ def _run_backbone_forward(
         for layer_type, rope in model._spyre_rope.items()
     }
 
-    # Sliding mask: base mask restricted to a local window. Query row j occupies
-    # cache coordinate block_base + j. Built on CPU (int arange + scalar offset);
-    # the band helpers keep the int/bool work off Spyre and return a float
-    # additive mask on attn_mask's device. Direction matches the base mask:
-    # causal (backward) for the LM path, symmetric for bidirectional embedders.
-    bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
     # block_base is the cache column this block's row 0 occupies. Decode writes one
-    # token per step, so that is simply the written slot.
-    #
-    # These two reads sync a scalar back from the device. That is fine here and
-    # deliberately not optimized: this runs once per step (not per layer) in
-    # eager code outside the compiled block, and the band helpers below already
-    # round-trip the whole mask through CPU because Spyre's Inductor backend
-    # rejects int64 compare-to-constant and bool intermediates. Gemma 3/4 are the
-    # only adapters that read a scalar out of cache_index at all.
+    # token per step, so that is simply the written slot. The read syncs a scalar
+    # back from the device — fine here and deliberately not optimized: it runs once
+    # per step (not per layer) in eager code outside the compiled block, and it is
+    # needed to build the runtime sliding mask outside the compiled blocks.
+    # Gemma 3/4 are the only adapters that read a scalar out of cache_index at all.
+    swa_mode = getattr(model, "_spyre_swa_mode", None)
+    bsz, seq_len = input_ids.shape[0], input_ids.shape[1]
     block_base = int(cache_index[0])
+
+    prefill_step = None
+    if swa_mode == "anchored" and seq_len > 1:
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base + seq_len)
+        sliding_layer = cfg.layer_types.index("sliding_attention")
+        capacity = physical_cache_capacity(key_caches[sliding_layer])
+        if prompt_len > capacity:
+            prefill_step = prefill_ring_step(
+                block_base, seq_len, capacity, cache_index.device
+            )
+
+    # Sliding mask = base mask restricted to a local window; query row j occupies
+    # cache coordinate block_base + j. The op consumes this same mask directly,
+    # making it the only position-dependent input to compiled attention.
     query_coords = (torch.arange(seq_len)[None, :] + block_base).expand(bsz, seq_len)
     if getattr(cfg, "use_bidirectional_attention", False):
         sliding_mask = _add_bidirectional_sliding_window_band(
@@ -297,20 +350,91 @@ def _run_backbone_forward(
         )
     else:
         sliding_mask = add_causal_sliding_window_band(
-            attn_mask, query_coords, cfg.sliding_window
+            attn_mask,
+            query_coords,
+            cfg.sliding_window,
+            key_cache_coords=(
+                prefill_step.key_cache_coords if prefill_step is not None else None
+            ),
         )
     masks = {"full_attention": attn_mask, "sliding_attention": sliding_mask}
 
+    # Anchored compact-buffer bookkeeping for the op path (mirrors hf_gemma4's
+    # _run_blocks_over_embeds). A prefill call (seq_len > 1) starts a new
+    # generation, so drop any state a previous generate() left behind.
+    if seq_len > 1 and block_base == 0:
+        model._spyre_swa_state = None
+    state = getattr(model, "_spyre_swa_state", None)
+
+    if swa_mode == "anchored" and state is None and seq_len == 1:
+        prompt_len = getattr(model, "_spyre_padded_prompt_len", block_base)
+        state = SlidingWindowCache.after_prefill(
+            cfg.sliding_window, prompt_len, valid_start_for(model, bsz)
+        )
+        compact_sliding_buffers(
+            cfg.layer_types, key_caches, value_caches, state, prompt_len
+        )
+        model._spyre_swa_state = state
+
+    if swa_mode and state is not None:
+        # Anchored decode: position and padding travel in one fixed-shape runtime
+        # mask shared by every sliding layer, so the whole cycle reuses one graph.
+        # On a shift step roll each sliding layer's compact buffer down one stick
+        # BEFORE its block writes — eager, into fresh allocations, kept out of the
+        # graph (see roll_compact_buffer for why an in-graph roll self-aliases).
+        step = anchored_step(state, cache_index.device, h.dtype)
+        if step.do_shift:
+            roll_sliding_buffers(cfg.layer_types, key_caches, value_caches)
+        masks["sliding_attention"] = step.attention_mask
+        sliding_index = step.cache_index
+    elif prefill_step is not None:
+        sliding_index = prefill_step.cache_index
+    elif swa_mode:
+        sliding_index = cache_index
+    else:
+        sliding_index = cache_index
+
+    sliding_masks_by_capacity = {}
     for i, compiled_block in enumerate(model._spyre_compiled_blocks):
         lt = cfg.layer_types[i]
+        is_sliding = lt == "sliding_attention"
+        selected_mask = masks[lt]
+        if is_sliding and swa_mode:
+            capacity = physical_cache_capacity(key_caches[i])
+            if (
+                swa_mode == "anchored"
+                and state is not None
+                and seq_len == 1
+                and capacity != state.capacity
+            ):
+                raise RuntimeError(
+                    f"anchored SWA layer {i} has cache capacity {capacity}, "
+                    f"expected compact capacity {state.capacity}"
+                )
+            if capacity not in sliding_masks_by_capacity:
+                sliding_masks_by_capacity[capacity] = fit_attention_mask(
+                    selected_mask, capacity
+                )
+            selected_mask = sliding_masks_by_capacity[capacity]
+            # A chunked-prefill cache can be a prefix view of the physical
+            # allocation on its first invocation.  The compiled in-place cache
+            # update subsequently exposes the owner, which is why the reusable
+            # mask above is sized to ``capacity``.  Match the custom op's exact
+            # Lk contract to the logical view presented by this invocation.
+            logical_width = key_caches[i].size(2)
+            if selected_mask.size(-1) != logical_width:
+                selected_mask = selected_mask[..., :logical_width]
         h, key_caches[i], value_caches[i] = compiled_block(
             h,
             freqs[lt],
-            masks[lt],
+            selected_mask,
             key_caches[i],
             value_caches[i],
-            cache_index,
+            sliding_index if is_sliding else cache_index,
         )
+
+    if swa_mode == "anchored" and state is not None and seq_len == 1:
+        state.advance()
 
     h = backbone.norm(h)
     return h
@@ -336,16 +460,7 @@ def _run_forward(
         cache_index,
     )
 
-    logits = model.lm_head(h)
-
-    # final_logit_softcapping is None on published Gemma 3 (dropped from Gemma 2);
-    # applied defensively if a checkpoint sets it.
-    cap = getattr(text_config(model.config), "final_logit_softcapping", None)
-    if cap is not None:
-        logits = logits / cap
-        logits = torch.tanh(logits)
-        logits = logits * cap
-    return logits
+    return run_lm_head(model, h)
 
 
 def prepare_for_spyre(model):
@@ -361,7 +476,7 @@ def prepare_for_spyre(model):
     2. Build one ``PrecomputedRotaryEmbedding`` per layer type from the model's
        per-type ``inv_freq`` buffers (no head padding — D/2 >= 64 already).
     3. Record per-layer KV-cache shapes (single head_dim for all layers).
-    4. Chunk the LM head for the large vocab (no-op for the bare embedder
+    4. Prepare the padded LM head (no-op for the bare embedder
        backbone, which has no ``lm_head``).
     5. Compile each decoder layer's block.
     """
@@ -371,7 +486,7 @@ def prepare_for_spyre(model):
     # Patch whichever concrete RMSNorm class this model uses. The norm module
     # closest to a decoder layer's input_layernorm is representative.
     rmsnorm_cls = type(backbone.layers[0].input_layernorm)
-    _patch_gemma3_rmsnorm(rmsnorm_cls)
+    _patch_gemma_rmsnorm(rmsnorm_cls)
 
     head_dim = cfg.head_dim
     num_q_heads = cfg.num_attention_heads
@@ -400,11 +515,41 @@ def prepare_for_spyre(model):
         (num_kv_heads, head_dim, head_dim) for _ in cfg.layer_types
     ]
 
-    # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
-    # the 256 MB EAR limit (see hf_common.pad_lm_head).
-    pad_lm_head(model)
+    # final_logit_softcapping is None on published Gemma 3 (dropped from Gemma
+    # 2); apply it defensively if a checkpoint sets it.
+    cap = getattr(cfg, "final_logit_softcapping", None)
+
+    def process_logits(logits):
+        if cap is not None:
+            logits = logits / cap
+            logits = torch.tanh(logits)
+            logits = logits * cap
+        return logits
+
+    prepare_lm_head_for_spyre(model, logits_processor=process_logits)
+
+    # The sliding-window op path is the default on the causal-LM path; set
+    # model._spyre_swa_mode = None before prepare to fall back to band-masked SDPA.
+    # The op is causal-only, so the bidirectional embedder path (EmbeddingGemma)
+    # forces the band regardless — its sliding layers score their whole window
+    # symmetrically, which the offset-and-length op cannot express.
+    if not hasattr(model, "_spyre_swa_mode"):
+        model._spyre_swa_mode = "anchored"
+    if getattr(cfg, "use_bidirectional_attention", False):
+        model._spyre_swa_mode = None
+    swa_mode = model._spyre_swa_mode
+    if swa_mode == "anchored":
+        model._spyre_cache_allocator = allocate_swa_caches
 
     model._spyre_compiled_blocks = [
-        _make_compiled_block(layer, num_q_heads, num_kv_heads, head_dim)
-        for layer in backbone.layers
+        _make_compiled_block(
+            layer,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            is_sliding=(cfg.layer_types[i] == "sliding_attention"),
+            window_size=cfg.sliding_window,
+            swa_mode=swa_mode,
+        )
+        for i, layer in enumerate(backbone.layers)
     ]

@@ -30,7 +30,8 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("microsoft/Phi-4-mini-instruct")
     tokenizer = AutoTokenizer.from_pretrained("microsoft/Phi-4-mini-instruct")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
@@ -45,11 +46,11 @@ from hf_adapters.hf_common import (
     apply_rope_matmul,
     get_backbone,
     kv_cache_update,
-    pad_lm_head,
     pad_qk_proj_for_rope,
-    patch_rmsnorm,
     permute_proj_for_rope,
+    prepare_lm_head_for_spyre,
     rope_dim_permutation,
+    run_lm_head,
     split_fused_linear,
 )
 
@@ -178,7 +179,7 @@ def _run_backbone_forward(
             cache_index,
         )
 
-    h = backbone.norm(h)
+    h = model._spyre_compiled_norm(h)
     return h
 
 
@@ -202,13 +203,11 @@ def _run_forward(
         cache_index,
     )
 
-    return model.lm_head(h)
+    return run_lm_head(model, h)
 
 
 def prepare_for_spyre(model):
     """Apply Spyre adaptations to Phi-3 model in-place."""
-    from transformers.models.phi3.modeling_phi3 import Phi3RMSNorm
-
     cfg = model.config
     hd = cfg.hidden_size // cfg.num_attention_heads
 
@@ -230,11 +229,8 @@ def prepare_for_spyre(model):
     model._spyre_rope = PrecomputedRotaryEmbedding(
         get_backbone(model).rotary_emb, padded_head_dim=work_hd
     )
-    patch_rmsnorm(Phi3RMSNorm)
 
-    # LM head: smooth-padded to a stick-aligned vocab whose per-core span fits
-    # the 256 MB EAR limit (see hf_common.pad_lm_head).
-    pad_lm_head(model)
+    prepare_lm_head_for_spyre(model)
 
     num_q = cfg.num_attention_heads
     num_kv = cfg.num_key_value_heads
@@ -286,3 +282,4 @@ def prepare_for_spyre(model):
             model._spyre_up_projs,
         )
     ]
+    model._spyre_compiled_norm = torch.compile(get_backbone(model).norm, dynamic=False)

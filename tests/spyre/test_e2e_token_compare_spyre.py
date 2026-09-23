@@ -24,7 +24,6 @@ Usage (on Spyre pod)::
     pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k qwen3
 """
 
-import math
 from typing import Any, Callable
 
 import pytest
@@ -33,8 +32,8 @@ from transformers import PreTrainedModel
 
 from hf_adapters.auto_spyre_model import dtype_for_model_path
 from hf_adapters.hf_common import (
-    BLOCK_SIZE,
     DEVICE,
+    encode_prompts,
     generation_cache_len,
     get_model_dtype,
     move_model_to_spyre,
@@ -43,6 +42,7 @@ from tests.conftest import load_ref_model, resolve_adapter_module_for_test
 from tests.model_registry import (
     CAUSAL_PATHS,
     NON_BLOCKING_CAUSAL_MODELS,
+    REMOTE_CODE_PATHS,
     xfail_non_blocking,
 )
 
@@ -93,10 +93,15 @@ def adapter_greedy_steps(
 ) -> list[dict[str, Any]]:
     """Run adapter forward on Spyre for prefill + N decode steps."""
     from hf_adapters.hf_common import (
+        BLOCK_SIZE,
+        _materialize_decode_mask_heads,
+        _prefill_cache_inputs,
+        _sdpa_compatible_kv_length,
         allocate_kv_caches,
         build_decode_mask,
         build_prefill_mask,
         make_cache_index,
+        pad_and_position,
     )
 
     batch_size = input_ids.shape[0]
@@ -105,40 +110,64 @@ def adapter_greedy_steps(
     cfg = model.config
     vocab_size = getattr(cfg, "vocab_size", None) or cfg.text_config.vocab_size
 
-    padded_len = math.ceil(seq_len / BLOCK_SIZE) * BLOCK_SIZE
-    prompt_offset = padded_len - seq_len
-    if prompt_offset > 0:
-        pad = input_ids.new_zeros((batch_size, prompt_offset))
-        padded_ids = torch.cat([pad, input_ids], dim=1)
-    else:
-        padded_ids = input_ids
+    actual_lengths = torch.full((batch_size,), seq_len, dtype=torch.long)
+    prefill_chunk_size = getattr(model, "_spyre_prefill_chunk_size", None)
+    padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
+        input_ids, actual_lengths, prefill_chunk_size or BLOCK_SIZE
+    )
+    prompt_offset = (
+        prompt_offsets if isinstance(prompt_offsets, int) else prompt_offsets[0].item()
+    )
 
-    position_ids = torch.zeros((batch_size, padded_len), dtype=torch.long)
-    position_ids[:, prompt_offset:] = torch.arange(seq_len)
+    # Mirror generate()'s per-sequence left-padding bookkeeping (hf_common.py:
+    # model._spyre_prompt_offsets = prompt_offsets). The band path reads its left
+    # padding out of the mask below, but the sliding-window op path cannot — an
+    # offset-and-length window has no way to skip pad columns, so it reads the
+    # padding from valid_start, which valid_start_for() pulls from this attribute.
+    # A harness that drives _run_forward directly must set it or the op attends the
+    # pad K/V (argmax flips while the logit magnitude barely moves).
+    model._spyre_prompt_offsets = prompt_offsets
+    model._spyre_padded_prompt_len = padded_len
 
-    max_cache_len = generation_cache_len(seq_len, num_decode + 1)
+    max_cache_len = generation_cache_len(padded_len, num_decode + 1)
+    prefill_kv_len = _sdpa_compatible_kv_length(padded_len)
     dtype = get_model_dtype(model)
 
     key_caches, value_caches = allocate_kv_caches(
         model, batch_size, max_cache_len, dtype
     )
+    chunked_prefill = prefill_chunk_size is not None
+    prefill_cache_len = prefill_kv_len if chunked_prefill else max_cache_len
+    prefill_key_caches = _prefill_cache_inputs(
+        key_caches, prefill_cache_len, chunked_prefill
+    )
+    prefill_value_caches = _prefill_cache_inputs(
+        value_caches, prefill_cache_len, chunked_prefill
+    )
 
     results = []
 
-    prefill_mask = build_prefill_mask(
-        batch_size, padded_len, max_cache_len, prompt_offset, dtype=dtype
-    )
-
+    query_chunk_size = prefill_chunk_size or padded_len
     with torch.no_grad():
-        logits = run_forward_fn(
-            model,
-            padded_ids.to(DEVICE),
-            position_ids.to(DEVICE),
-            prefill_mask.to(DEVICE),
-            key_caches,
-            value_caches,
-            cache_index=make_cache_index(0, padded_len, DEVICE),
-        )
+        for chunk_start in range(0, padded_len, query_chunk_size):
+            chunk_end = chunk_start + query_chunk_size
+            prefill_mask = build_prefill_mask(
+                batch_size,
+                query_chunk_size,
+                prefill_cache_len,
+                prompt_offset,
+                dtype=dtype,
+                query_start=chunk_start,
+            )
+            logits = run_forward_fn(
+                model,
+                padded_ids[:, chunk_start:chunk_end].to(DEVICE),
+                position_ids[:, chunk_start:chunk_end].to(DEVICE),
+                prefill_mask.to(DEVICE),
+                prefill_key_caches,
+                prefill_value_caches,
+                cache_index=make_cache_index(chunk_start, query_chunk_size, DEVICE),
+            )
     logits_cpu = logits.to("cpu")[0, -1, :].float()[:vocab_size]
     token = logits_cpu.argmax().item()
     results.append({"logits": logits_cpu, "token": token, "step": 0})
@@ -160,6 +189,9 @@ def adapter_greedy_steps(
         decode_mask = build_decode_mask(
             batch_size, max_cache_len, current_cache_len, prompt_offset, dtype=dtype
         )
+        decode_mask_heads = getattr(model, "_spyre_decode_mask_num_heads", None)
+        if decode_mask_heads:
+            decode_mask = _materialize_decode_mask_heads(decode_mask, decode_mask_heads)
         with torch.no_grad():
             logits = run_forward_fn(
                 model,
@@ -250,21 +282,34 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
         )
 
 
-def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]]:
+def _run_model_test(
+    model_path: str, num_decode: int = 4, trust_remote_code: bool | None = None
+) -> list[dict[str, Any]]:
     """Full comparison for one model. Returns the list of comparison rows."""
     from transformers import AutoTokenizer
 
-    adapter = resolve_adapter_module_for_test(model_path)
+    if trust_remote_code is None:
+        trust_remote_code = model_path in REMOTE_CODE_PATHS
+    adapter = resolve_adapter_module_for_test(
+        model_path, trust_remote_code=trust_remote_code
+    )
 
     print(f"\n{'=' * 70}")
     print(f"  {model_path}")
     print(f"{'=' * 70}")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = load_ref_model(model_path=model_path, adapter_mod=adapter)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
+    model = load_ref_model(
+        model_path=model_path, adapter_mod=adapter, trust_remote_code=trust_remote_code
+    )
 
     prompt = "The capital of France is"
-    encoded = tokenizer(prompt, return_tensors="pt")
+    # Tokenize following the model's canonical scheme (chat template for
+    # instruct models, plain post-processing for base models). The same IDs feed
+    # the HF reference and Spyre adapter, keeping the comparison symmetric.
+    encoded = encode_prompts(tokenizer, prompt)
     input_ids = encoded["input_ids"]
     print(f"  Prompt: {prompt!r} ({input_ids.shape[1]} tokens)")
 
@@ -273,7 +318,11 @@ def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]
 
     # Use bf16/fp16 dtype, requested by the registry or based on the model config.
     # (Spyre does not support float32, so float32 entries will use fp16.)
-    spyre_dtype = dtype_for_model_path(model_path, target_device="spyre")
+    spyre_dtype = dtype_for_model_path(
+        model_path,
+        target_device="spyre",
+        trust_remote_code=trust_remote_code,
+    )
     move_model_to_spyre(model=model, module=adapter, dtype=spyre_dtype)
     print("  Running adapter on Spyre ...")
     adapter_results = adapter_greedy_steps(
@@ -288,8 +337,9 @@ def _run_model_test(model_path: str, num_decode: int = 4) -> list[dict[str, Any]
 
 def token_compare_spyre(
     model_path: str,
+    trust_remote_code: bool | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    rows = _run_model_test(model_path)
+    rows = _run_model_test(model_path, trust_remote_code=trust_remote_code)
     mismatches = [r for r in rows if not r["top1_match"]]
     return mismatches, rows
 
@@ -297,8 +347,12 @@ def token_compare_spyre(
 @pytest.mark.parametrize(
     "model_path", xfail_non_blocking(CAUSAL_PATHS, table=NON_BLOCKING_CAUSAL_MODELS)
 )
-def test_e2e_token_compare_spyre(model_path: str) -> None:
-    mismatches, rows = token_compare_spyre(model_path)
+def test_e2e_token_compare_spyre(
+    model_path: str, trust_remote_code: bool | None
+) -> None:
+    mismatches, rows = token_compare_spyre(
+        model_path, trust_remote_code=trust_remote_code
+    )
     _print_table(rows)
     n_match = sum(1 for r in rows if r["top1_match"])
     print(f"\nTop-1 agreement: {n_match}/{len(rows)} steps")

@@ -13,17 +13,17 @@
 # limitations under the License.
 
 """
-Unified (encoder-free) HuggingFace adapter for Gemma 4 12B on Spyre — image→text.
+HuggingFace adapter for Gemma 4 multimodal models on Spyre — image→text.
 
-Where ``hf_gemma4`` runs only the text decoder (``AutoSpyreModelForCausalLM``),
-this module loads the full unified multimodal model
-(``Gemma4UnifiedForConditionalGeneration``, ``model_type=gemma4_unified``) via
-``AutoModelForImageTextToText`` and runs the image→text pipeline. It is the
-adapter behind ``AutoSpyreModelForImageTextToText``.
+Supports both encoder-free ``Gemma4UnifiedConfig`` checkpoints and full-vision
+``Gemma4Config`` checkpoints. Full checkpoints run their transformer encoder
+blocks on Spyre while keeping position lookup and spatial pooling on CPU. The
+shared multimodal frontend scatters projected image features into ``<image>``
+token slots, then delegates to the existing Gemma 4 dense/PLE or MoE text
+implementation selected by the nested text config.
 
-Gemma 4 is **encoder-free**: there is no vision tower. Vision is a pure
-projection of raw (processor-merged) pixel patches into the LM embedding space,
-scattered into the ``<image>`` token slots of the text embeddings:
+For encoder-free checkpoints, vision is a pure projection of raw
+(processor-merged) pixel patches into the LM embedding space:
 
     pixel_values [B, P, 48²·3]                    (processor already merged
       │   image_position_ids [B, P, 2]             pooling_kernel_size² raw
@@ -42,21 +42,12 @@ scattered into the ``<image>`` token slots of the text embeddings:
     logits  ──► final_logit_softcapping
 
 **Bidirectional vision attention.** ``text_config.use_bidirectional_attention ==
-"vision"``: within one image, the soft-tokens attend to each other
-bidirectionally. Stock builds every layer-type mask via
-``create_causal_mask(block_sequence_ids=...)``, which OR-s a "blockwise" overlay
-(same image group ⇒ allowed, from ``mm_token_type_ids``) into the causal mask for
-**both** full and sliding layers — NOT sliding-only. So at prefill we OR the
-blockwise band into the base causal mask for both types:
-
-  - full_attention  = OR(causal, blockwise)
-  - sliding_attention = AND(sliding_window, OR(causal, blockwise))
-
-Decode steps are pure text (one new causal token), so no blockwise band is
-needed after prefill. (Verified against stock ``create_causal_mask``: the
-``create_masks_for_vision_model`` docstring claiming globals stay causal is not
-the path the forward takes — traced directly through
-``create_masks_for_generate`` → ``create_causal_mask``.)
+"vision"``: within one image, soft tokens attend bidirectionally. Full-vision
+``Gemma4Config`` checkpoints keep full-attention layers causal and build sliding
+masks as ``AND(sliding_window, OR(causal, blockwise))``. Encoder-free
+``Gemma4UnifiedConfig`` checkpoints build full masks as ``OR(causal, blockwise)``
+and sliding masks as ``OR(AND(sliding_window, causal), blockwise)``. Decode steps
+are pure text, so no blockwise band is needed after prefill.
 
 **Vision embedder on Spyre.** The compilable core (LN₁→Dense→LN₂→+posemb→
 pos_norm→RMSNorm→Linear) is ``torch.compile``d and runs on Spyre. The
@@ -68,9 +59,8 @@ The CPU-built per-patch positional-embedding tensor is passed into the compiled
 core as a device argument.
 
 The text decoder reuses ``hf_gemma4`` unchanged. Both towers live under the one loaded VLM, so a
-single ``prepare_for_spyre`` covers them. Exposes ``prefill_logits``
-(first-token forward) and ``generate`` (full autoregressive decode — image
-features scattered at prefill; decode steps are pure text).
+single ``prepare_for_spyre`` covers them. Exposes the private prefill/decode
+hooks used by the auto model's generation loop.
 
 Scope: **text + image**. Audio and video are asserted out loudly
 (``prepare_for_spyre`` / forward raise if audio/video inputs are present).
@@ -78,23 +68,54 @@ Scope: **text + image**. Audio and video are asserted out loudly
 
 import torch
 
-from hf_adapters import hf_gemma4
+from hf_adapters import hf_gemma4, hf_gemma4_moe, hf_gemma4_vision
 from hf_adapters.hf_common import (
     DEVICE,
-    _resolve_generation_params,
-    allocate_kv_caches,
-    build_decode_mask,
-    build_prefill_mask,
-    decode_block_walk,
-    generation_cache_len,
     get_backbone,
     get_model_dtype,
-    make_cache_index,
-    pad_and_position,
     patch_layernorm,
-    select_next_token,
+    run_lm_head,
     text_config,
 )
+
+# The multimodal auto class selects this adapter rather than the standalone
+# text adapter.  Forward the text decoder's TP loading policies so MoE weights
+# are staged and low-count KV heads are grouped exactly as in text-only loads.
+SPYRE_TP_CPU_STAGED_MODULES = hf_gemma4_moe.SPYRE_TP_CPU_STAGED_MODULES
+spyre_tp_grouped_colwise_modules = hf_gemma4.spyre_tp_grouped_colwise_modules
+
+
+def spyre_tp_cpu_replicated_modules(model, tp_size):
+    """Keep the full vision encoder on CPU until its Spyre preparation pass.
+
+    The Gemma 4 vision executor consumes parameter tensors directly and does
+    not run Transformers' per-module TP hooks.  Replicating these modules is
+    therefore required for correctness.  Staging them on CPU also lets the
+    vision adapter pad Q/K/V and MLP weights before their one layout-aware
+    transfer to Spyre.
+    """
+    del tp_size
+    prefix = "model.vision_tower.encoder."
+    modules = set()
+    for name, module in model.named_modules():
+        if not name.startswith(prefix):
+            continue
+        has_direct_state = (
+            next(module.parameters(recurse=False), None) is not None
+            or next(module.buffers(recurse=False), None) is not None
+        )
+        wraps_linear = isinstance(getattr(module, "linear", None), torch.nn.Linear)
+        if has_direct_state or wraps_linear:
+            modules.add(name)
+    return modules
+
+
+_GENERATION_INPUT_NAMES: tuple = (
+    "pixel_values",
+    "image_position_ids",
+    "mm_token_type_ids",
+)
+_GENERATION_TOKEN_ALIGNED_INPUTS: dict = {"mm_token_type_ids": 0}
 
 
 def _vision_embedder(model):
@@ -146,27 +167,50 @@ def prepare_for_spyre(model):
     vision-capable unified checkpoint and that audio is out of scope.
     """
     cfg = text_config(model.config)
-    assert getattr(cfg, "use_bidirectional_attention", None) == "vision", (
-        "hf_gemma4_mm expects a unified Gemma 4 with "
-        "use_bidirectional_attention='vision'; got "
-        f"{getattr(cfg, 'use_bidirectional_attention', None)!r}."
+    assert getattr(cfg, "use_bidirectional_attention", None) in (None, "vision"), (
+        "hf_gemma4_mm supports causal or vision-bidirectional Gemma 4 text; got "
+        f"use_bidirectional_attention={getattr(cfg, 'use_bidirectional_attention', None)!r}."
     )
     assert getattr(model.model, "embed_vision", None) is not None, (
         "hf_gemma4_mm requires a vision embedder (model.model.embed_vision); "
         "this checkpoint has no vision_config."
     )
 
-    # Shared text decoder (mirrors hf_gemma4.prepare_for_spyre).
-    hf_gemma4.prepare_text_decoder_for_spyre(model)
+    # VLM prefill contains bidirectional vision regions. The mask remains the
+    # source of exact semantics; the non-causal flag selects the generic kernel
+    # access plan so those future image-token edges are reachable.
+    model._spyre_swa_mode = "anchored"
+    model._spyre_swa_is_causal = False
 
-    # Vision projection core, compiled for Spyre. The three vision LayerNorms
-    # (patch_ln1/patch_ln2/pos_norm) must be patched to the un-fused
-    # decomposition BEFORE compiling: the fused F.layer_norm lowering NaNs on
-    # near-constant patch rows (see patch_layernorm / the doc). Patch first, then
-    # compile so the core captures the patched forward.
-    embedder = _vision_embedder(model)
-    patch_layernorm(embedder.patch_ln1, embedder.patch_ln2, embedder.pos_norm)
-    model._spyre_vision_core = _make_compiled_vision_core(embedder)
+    # Reuse the text adapter selected by the nested decoder configuration.
+    if getattr(cfg, "enable_moe_block", False):
+        hf_gemma4_moe.prepare_text_decoder_for_spyre(model)
+    else:
+        hf_gemma4.prepare_text_decoder_for_spyre(model)
+
+    if getattr(model.model, "vision_tower", None) is not None:
+        # Full checkpoints run the dense transformer body on Spyre. The position
+        # lookup, spatial pooler, and text-space projection remain on CPU.
+        hf_gemma4_vision.prepare_for_spyre(model)
+        cpu_submodules = list(getattr(model, "_spyre_cpu_submodules", []))
+        cpu_submodules.extend(
+            [
+                "model.vision_tower.patch_embedder",
+                "model.vision_tower.pooler",
+                "model.embed_vision",
+            ]
+        )
+        if getattr(model.model, "audio_tower", None) is not None:
+            cpu_submodules.extend(["model.audio_tower", "model.embed_audio"])
+        model._spyre_cpu_submodules = cpu_submodules
+        model._spyre_vision_core = None
+    else:
+        # Unified checkpoints use an attention-free projection core on Spyre.
+        # Patch the three LayerNorms before compiling so the graph captures the
+        # unfused fp32-reduction implementation.
+        embedder = _vision_embedder(model)
+        patch_layernorm(embedder.patch_ln1, embedder.patch_ln2, embedder.pos_norm)
+        model._spyre_vision_core = _make_compiled_vision_core(embedder)
 
 
 def _build_pos_embs(embedder, image_position_ids):
@@ -187,20 +231,20 @@ def _build_pos_embs(embedder, image_position_ids):
 
 
 def _image_features(model, pixel_values, image_position_ids):
-    """Run the Spyre vision core and return stripped features [valid_patches, H].
-
-    CPU: build the positional embeddings and the padding mask. Spyre: the
-    LN/Dense/RMSNorm projection core. CPU: strip padding patches
-    (``image_position_ids == -1`` on both axes), matching stock
-    ``get_image_features``.
-    """
-    embedder = _vision_embedder(model)
-    dtype = get_model_dtype(model)
-
-    # anyres / multi-image: [B, T, P, ...] -> [B*T, P, ...] (stock flattens too)
+    """Run the checkpoint's vision path and return flattened text-space features."""
+    # anyres / multi-image: [B, T, P, ...] -> [B*T, P, ...]
     if pixel_values.dim() == 4:
         pixel_values = pixel_values.flatten(0, 1)
         image_position_ids = image_position_ids.flatten(0, 1)
+
+    if getattr(model.model, "vision_tower", None) is not None:
+        features = hf_gemma4_vision.prefill_vision_tower(
+            model, pixel_values, image_position_ids
+        )
+        return model.model.embed_vision(features.to("cpu"))
+
+    embedder = _vision_embedder(model)
+    dtype = get_model_dtype(model)
 
     pos_embs = _build_pos_embs(embedder, image_position_ids).to(dtype)
     features = model._spyre_vision_core(
@@ -214,24 +258,29 @@ def _image_features(model, pixel_values, image_position_ids):
 
 
 def _embed_and_scatter(model, input_ids, image_features):
-    """Scaled word embeddings with image features scattered into <image> slots.
+    """Build decoder and PLE-context embeddings for multimodal prefill.
 
     ``embed_tokens`` is ``Gemma4UnifiedTextScaledWordEmbedding`` (×√hidden runs
     as-is). Stock does ``inputs_embeds.masked_scatter(image_mask, features)``;
     Spyre can't ``masked_scatter``, so we zero the image-token slots (elementwise
     mul by a CPU-built keep factor) and add a CPU-built additive tensor holding
     the features at the image positions — bit-identical given the zeroed slots
-    (same doctrine as hf_granite_vision_mm._inject_deepstack). Asserts the
-    token/feature counts match (mirrors stock's shape check).
+    (same doctrine as hf_granite_vision_mm._inject_deepstack). The separately
+    returned PLE context keeps scaled text embeddings but replaces image slots
+    with the raw, unscaled pad embedding, matching stock Gemma 4. The returned
+    token ids apply the same image-to-pad substitution for PLE token identity.
+    Asserts the token/feature counts match (mirrors stock's shape check).
     """
     backbone = get_backbone(model)
     image_token_id = model.config.image_token_id
     dtype = get_model_dtype(model)
 
-    ids = input_ids.to(backbone.embed_tokens.weight.device)
+    input_ids_cpu = input_ids.to("cpu").clone()
+    image_mask = input_ids_cpu == image_token_id  # [B, L] bool
+    input_ids_cpu[image_mask] = text_config(model.config).pad_token_id
+    ids = input_ids_cpu.to(backbone.embed_tokens.weight.device)
     h = backbone.embed_tokens(ids)  # scaled word embeddings, on embed device
 
-    image_mask = input_ids == image_token_id  # [B, L] bool, CPU
     n_image_tokens = int(image_mask.sum())
     hidden = h.shape[-1]
     feats = image_features.to("cpu", dtype)
@@ -242,11 +291,18 @@ def _embed_and_scatter(model, input_ids, image_features):
         )
 
     keep = (~image_mask).to(dtype).unsqueeze(-1).to(h.device)
-    h = h * keep
+    text_embeds = h * keep
 
-    additive = torch.zeros(h.shape[0], h.shape[1], hidden, dtype=dtype)
-    additive[image_mask] = feats.view(n_image_tokens, hidden)
-    return h + additive.to(h.device)
+    image_additive = torch.zeros(h.shape[0], h.shape[1], hidden, dtype=dtype)
+    image_additive[image_mask] = feats.view(n_image_tokens, hidden)
+    inputs_embeds = text_embeds + image_additive.to(h.device)
+
+    ple_context_embeds = None
+    if model._spyre_has_ple:
+        raw_pad = backbone.embed_tokens.weight[text_config(model.config).pad_token_id]
+        pad_additive = image_mask.to(dtype).unsqueeze(-1).to(h.device) * raw_pad
+        ple_context_embeds = text_embeds + pad_additive
+    return inputs_embeds, ple_context_embeds, input_ids_cpu
 
 
 def _blockwise_band(mm_token_type_ids, padded_len, max_cache_len, dtype):
@@ -293,16 +349,12 @@ def _blockwise_band(mm_token_type_ids, padded_len, max_cache_len, dtype):
 
 
 def _sliding_window_lower_band(mask, sliding_window):
-    """Restrict an additive prefill mask to the sliding-window *lower bound* only.
+    """Apply stock's sliding-window lower bound to an additive prefill mask.
 
     Masks keys further back than ``sliding_window`` (``q - k >= window``) but —
-    unlike ``hf_common.add_causal_sliding_window_band`` — does NOT mask future
-    keys (``q - k < 0``). This is stock's ``sliding_window_overlay``
-    (``kv_idx > q_idx - window``), an ``and_mask`` applied *after* the base
-    ``OR(causal, blockwise)`` composition: the causal upper bound already lives
-    in that base, so the window only supplies the backward cutoff. Applying the
-    causal window band instead would re-mask the forward-attending bidirectional
-    image pairs.
+    unlike ``hf_common.add_causal_sliding_window_band`` — does not independently
+    mask future keys. For multimodal prefill, call this after OR-ing the causal and
+    blockwise masks so the window gates bidirectional image edges too.
 
     Prefill only (``cache_index`` starts at cache slot 0), so a query row's cache
     coordinate is its row index ``q`` and the key column is the cache slot ``k``.
@@ -321,27 +373,25 @@ def _sliding_window_lower_band(mask, sliding_window):
     return (mask.to("cpu") + band[None, None, :, :]).to(orig_device)
 
 
-def _build_mm_masks(prefill_mask, blockwise_band, sliding_window):
-    """Per-layer-type masks for a multimodal prefill: {full, sliding}.
-
-    Stock builds every mask type via ``create_causal_mask(block_sequence_ids)``,
-    which OR-s the blockwise vision overlay into the causal mask for **both** full
-    and sliding layers (traced through ``create_masks_for_generate`` →
-    ``create_causal_mask``):
-
-      - full_attention  = OR(causal, blockwise)
-      - sliding_attention = AND(sliding_window_lowerbound, OR(causal, blockwise))
-
-    The OR is an elementwise ``max`` of the two additive (0 / -inf) masks, done on
-    CPU to avoid the bf16 ``-inf + -inf`` NaN hazard. Prefill only.
-    ``prefill_mask``/``blockwise_band`` are ``[B, 1, padded_len, max_cache_len]``.
-    """
+def _build_mm_masks(prefill_mask, blockwise_band, sliding_window, *, unified):
+    """Build the architecture-specific Gemma 4 multimodal attention masks."""
     orig_device = prefill_mask.device
-    full_mask = torch.maximum(prefill_mask.to("cpu"), blockwise_band.to("cpu")).to(
-        orig_device
-    )
-    sliding_mask = _sliding_window_lower_band(full_mask, sliding_window)
-    return {"full_attention": full_mask, "sliding_attention": sliding_mask}
+    prefill_cpu = prefill_mask.to("cpu")
+    blockwise_cpu = blockwise_band.to("cpu")
+
+    if unified:
+        full_mask = torch.maximum(prefill_cpu, blockwise_cpu)
+        sliding_causal = _sliding_window_lower_band(prefill_cpu, sliding_window)
+        sliding_mask = torch.maximum(sliding_causal.to("cpu"), blockwise_cpu)
+    else:
+        full_mask = prefill_cpu
+        blockwise_causal = torch.maximum(prefill_cpu, blockwise_cpu)
+        sliding_mask = _sliding_window_lower_band(blockwise_causal, sliding_window)
+
+    return {
+        "full_attention": full_mask.to(orig_device),
+        "sliding_attention": sliding_mask.to(orig_device),
+    }
 
 
 def _logits_from_embeds(
@@ -353,6 +403,8 @@ def _logits_from_embeds(
     value_caches,
     cache_index,
     masks=None,
+    input_ids=None,
+    ple_context_embeds=None,
 ):
     """Text decoder over image-scattered embeds → logits (+ softcap).
 
@@ -367,7 +419,29 @@ def _logits_from_embeds(
     ``[0, padded_len)`` at prefill, a single slot per decode step. Every computed
     position is written, so the shared walk's sliding-window ``block_base`` is
     simply ``cache_index[0]``: the cache column the (only) query row occupies.
+    ``ple_context_embeds`` optionally carries stock's pre-scatter multimodal PLE
+    context: scaled text embeddings with image positions replaced by the raw,
+    unscaled pad embedding. Decode omits it and uses ``inputs_embeds`` directly.
     """
+    cfg = text_config(model.config)
+    query_row_mask = None
+    if inputs_embeds.shape[1] > 1 and not getattr(cfg, "enable_moe_block", False):
+        query_row_mask = hf_gemma4._query_row_mask(inputs_embeds, attn_mask)
+        inputs_embeds = inputs_embeds * query_row_mask
+
+    if model._spyre_has_ple:
+        if input_ids is None:
+            raise ValueError(
+                "Gemma 4 PLE decoding requires input_ids alongside inputs_embeds."
+            )
+
+        per_layer_inputs = hf_gemma4._compute_per_layer_inputs(
+            model,
+            inputs_embeds if ple_context_embeds is None else ple_context_embeds,
+            input_ids,
+        )
+    else:
+        per_layer_inputs = None
     h = hf_gemma4._run_blocks_over_embeds(
         model,
         inputs_embeds,
@@ -377,238 +451,63 @@ def _logits_from_embeds(
         value_caches,
         cache_index,
         masks=masks,
+        per_layer_inputs=per_layer_inputs,
+        query_row_mask=query_row_mask,
     )
-    logits = model.lm_head(h)
-    cap = text_config(model.config).final_logit_softcapping
-    if cap is not None:
-        logits = logits / cap
-        logits = torch.tanh(logits)
-        logits = logits * cap
-    return logits
+    return run_lm_head(model, h)
 
 
 def _prefill_forward(
+    *,
     model,
-    padded_ids,
-    padded_len,
-    prompt_offsets,
+    input_ids,
     position_ids,
+    attention_mask,
+    key_caches,
+    value_caches,
+    cache_index,
     pixel_values,
     image_position_ids,
     mm_token_type_ids,
-    key_caches,
-    value_caches,
-    max_cache_len,
 ):
     """Shared multimodal prefill: padded ids + image → full-sequence logits.
 
     Builds scaled text embeddings with the image features scattered into the
-    ``<image>`` slots, then the per-layer-type masks with the bidirectional
-    vision overlay OR-ed into both full and sliding layers, and runs the decoder
-    once (writing the KV caches). ``mm_token_type_ids`` is the *unpadded* batch
-    tensor; it is left-padded here to match ``padded_ids``.
+    ``<image>`` slots, then the architecture-specific blockwise vision masks,
+    and runs the decoder once (writing the KV caches).
+    ``mm_token_type_ids`` has already undergone
+    the same prompt compaction and block padding as ``input_ids``.
     """
     dtype = get_model_dtype(model)
     cfg = text_config(model.config)
     image_features = _image_features(model, pixel_values, image_position_ids)
-    inputs_embeds = _embed_and_scatter(model, padded_ids, image_features)
-
-    mm_padded = _pad_mm_token_type_ids(mm_token_type_ids, padded_len)
-    prefill_mask = build_prefill_mask(
-        padded_ids.shape[0], padded_len, max_cache_len, prompt_offsets, dtype=dtype
+    inputs_embeds, ple_context_embeds, ple_input_ids = _embed_and_scatter(
+        model, input_ids, image_features
     )
-    blockwise = _blockwise_band(mm_padded, padded_len, max_cache_len, dtype)
-    masks = _build_mm_masks(prefill_mask, blockwise, cfg.sliding_window)
-    masks = {lt: m.to(DEVICE) for lt, m in masks.items()}
+
+    masks = None
+    if getattr(cfg, "use_bidirectional_attention", None) == "vision":
+        padded_len = input_ids.shape[1]
+        max_cache_len = attention_mask.shape[-1]
+        blockwise = _blockwise_band(mm_token_type_ids, padded_len, max_cache_len, dtype)
+        masks = _build_mm_masks(
+            attention_mask,
+            blockwise,
+            cfg.sliding_window,
+            unified=getattr(model.model, "vision_tower", None) is None,
+        )
+        masks = {lt: m.to(DEVICE) for lt, m in masks.items()}
     return _logits_from_embeds(
         model,
         inputs_embeds.to(DEVICE),
         position_ids.to(DEVICE),
-        prefill_mask.to(DEVICE),
+        attention_mask.to(DEVICE),
         key_caches,
         value_caches,
-        cache_index=make_cache_index(0, padded_len, DEVICE),
+        cache_index=cache_index,
         masks=masks,
+        input_ids=ple_input_ids.to(DEVICE),
+        ple_context_embeds=(
+            ple_context_embeds.to(DEVICE) if ple_context_embeds is not None else None
+        ),
     )
-
-
-def _pad_mm_token_type_ids(mm_token_type_ids, padded_len):
-    """Left-pad ``mm_token_type_ids`` to ``padded_len`` with 0 (text), matching
-    ``pad_and_position``'s left block-pad of ``input_ids``."""
-    bsz, seq = mm_token_type_ids.shape
-    if padded_len == seq:
-        return mm_token_type_ids
-    pad = mm_token_type_ids.new_zeros((bsz, padded_len - seq))
-    return torch.cat([pad, mm_token_type_ids], dim=1)
-
-
-def prefill_logits(
-    model,
-    input_ids,
-    attention_mask,
-    pixel_values,
-    image_position_ids,
-    mm_token_type_ids,
-):
-    """One-shot prefill of the (text + scattered image) sequence → logits.
-
-    Left-pads to a BLOCK_SIZE multiple (same convention as ``generate``),
-    scatters image features into ``<image>`` slots, runs the decoder once with
-    the bidirectional vision band on sliding layers, and returns full-sequence
-    logits ``[B, L, padded_vocab]`` (callers take ``[:, -1, :true_vocab]``).
-    """
-    actual_lengths = attention_mask.sum(dim=1)
-    padded_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_lengths
-    )
-    key_caches, value_caches = allocate_kv_caches(
-        model, padded_ids.shape[0], padded_len, get_model_dtype(model)
-    )
-    logits = _prefill_forward(
-        model,
-        padded_ids,
-        padded_len,
-        prompt_offsets,
-        position_ids,
-        pixel_values,
-        image_position_ids,
-        mm_token_type_ids,
-        key_caches,
-        value_caches,
-        max_cache_len=padded_len,
-    )
-    return logits, padded_len, input_ids.shape[1]
-
-
-def generate(
-    model,
-    processor,
-    input_ids,
-    attention_mask,
-    pixel_values,
-    image_position_ids,
-    mm_token_type_ids,
-    max_new_tokens,
-    do_sample=None,
-    temperature=None,
-    top_k=None,
-    top_p=None,
-):
-    """Autoregressive image→text generation on Spyre (greedy / top-k/p sampling).
-
-    Mirrors ``hf_common.generate``'s single-token decode, driven by embeddings so
-    the prefill step carries the image scatter + bidirectional vision mask:
-
-    - **Prefill** (step 0): scaled text embeds with ``<image>`` slots filled by
-      the vision features; decoder runs once with the blockwise band on sliding
-      layers.
-    - **Decode** (steps ≥1): the single token the previous step produced is
-      embedded (scaled) and fed back, writing one cache slot — pure text, causal,
-      no image band. Generated tokens are therefore contiguous from ``padded_len``.
-
-    Inputs come pre-tokenized from the checkpoint's ``AutoProcessor`` (chat
-    template + image-token expansion). Assumes **left-padded** input
-    (``processor.tokenizer.padding_side='left'``). Returns EOS-trimmed strings.
-    """
-    tokenizer = processor.tokenizer
-    params = _resolve_generation_params(
-        model,
-        tokenizer,
-        {
-            "do_sample": do_sample,
-            "temperature": temperature,
-            "top_k": top_k,
-            "top_p": top_p,
-        },
-    )
-    do_sample = params["do_sample"]
-    temperature = params["temperature"]
-    top_k = params["top_k"]
-    top_p = params["top_p"]
-    eos_ids = params["eos_ids"]
-
-    backbone = get_backbone(model)
-    model_d_type = get_model_dtype(model)
-
-    batch_size, prompt_length = input_ids.shape
-    actual_prompt_lengths = attention_mask.sum(dim=1)  # [B]
-
-    max_cache_len = generation_cache_len(prompt_length, max_new_tokens)
-    input_ids, padded_len, prompt_offsets, position_ids = pad_and_position(
-        input_ids, actual_prompt_lengths
-    )
-
-    key_caches, value_caches = allocate_kv_caches(
-        model, batch_size, max_cache_len, model_d_type
-    )
-
-    # Decode state. Every decode step writes exactly one token at
-    # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``
-    # and ``result`` just grows by one column per step.
-    result = input_ids.clone()
-    current_cache_len = padded_len
-    finished = torch.zeros(batch_size, dtype=torch.bool)
-    num_generated = torch.zeros(batch_size, dtype=torch.long)
-
-    def embed_ids(ids):
-        """Token ids -> scaled embeddings (decode steps; pure text)."""
-        return backbone.embed_tokens(ids)
-
-    for i in range(max_new_tokens):
-        if i == 0:
-            # --- PREFILL: text embeds with image scatter + blockwise vision band ---
-            logits = _prefill_forward(
-                model,
-                input_ids,
-                padded_len,
-                prompt_offsets,
-                position_ids,
-                pixel_values,
-                image_position_ids,
-                mm_token_type_ids,
-                key_caches,
-                value_caches,
-                max_cache_len,
-            )
-            next_logits = logits.to("cpu")[:, -1, :]
-            current_cache_len = padded_len
-        else:
-            # --- DECODE: one token in, one cache slot written (pure text) ---
-            # The token to feed is the one the previous step appended.
-            next_input = result[:, -1:].to(DEVICE)
-            next_embeds = embed_ids(next_input)
-            # Absolute position of that token per sequence: its cache column
-            # minus the sequence's left-padding offset.
-            decode_pos = (current_cache_len - prompt_offsets).unsqueeze(1)  # [B, 1]
-            decode_mask = build_decode_mask(
-                batch_size,
-                max_cache_len,
-                current_cache_len,
-                prompt_offsets,
-                dtype=model_d_type,
-            )
-            logits = _logits_from_embeds(
-                model,
-                next_embeds,
-                decode_pos.to(DEVICE),
-                decode_mask.to(DEVICE),
-                key_caches,
-                value_caches,
-                cache_index=make_cache_index(current_cache_len, 1, DEVICE),
-            )
-            next_logits = logits.to("cpu")[:, -1, :]
-            current_cache_len += 1
-
-        next_tokens = select_next_token(
-            next_logits, do_sample, temperature, top_k, top_p
-        )
-
-        # Append the token: generated slots are contiguous from padded_len.
-        result = torch.cat([result, next_tokens.unsqueeze(1)], dim=1)
-        if eos_ids is not None:
-            finished |= torch.isin(next_tokens, eos_ids)
-        num_generated += (~finished).long()
-        if finished.all():
-            break
-
-    return decode_block_walk(result, num_generated, padded_len, eos_ids, tokenizer)

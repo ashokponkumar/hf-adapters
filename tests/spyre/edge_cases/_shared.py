@@ -43,13 +43,24 @@ from tests._generate_edge_case_helpers import (
     hf_reference_outputs,
     make_prompts,
 )
-from tests.conftest import load_ref_model, resolve_adapter_module_for_test
+from tests.conftest import (
+    encode_generation_inputs,
+    load_ref_model,
+    resolve_adapter_module_for_test,
+)
+from tests.model_registry import REMOTE_CODE_PATHS
 
 
-def _load_spyre_model(model_path: str) -> PreTrainedModel:
+def _load_spyre_model(
+    model_path: str, trust_remote_code: bool | None = None
+) -> PreTrainedModel:
     print(f"  Loading {model_path} on Spyre ...")
+    if trust_remote_code is None:
+        trust_remote_code = model_path in REMOTE_CODE_PATHS
     t0 = time.time()
-    model = AutoSpyreModelForCausalLM.from_pretrained(model_path)
+    model = AutoSpyreModelForCausalLM.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
     print(f"  Spyre load+prepare: {time.time() - t0:.1f}s")
     return model
 
@@ -57,12 +68,25 @@ def _load_spyre_model(model_path: str) -> PreTrainedModel:
 def _setup(
     model_path: str,
     need_ref: bool,
+    trust_remote_code: bool | None = None,
 ):
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    adapter = resolve_adapter_module_for_test(model_path)
+    if trust_remote_code is None:
+        trust_remote_code = model_path in REMOTE_CODE_PATHS
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path, trust_remote_code=trust_remote_code
+    )
+    adapter = resolve_adapter_module_for_test(
+        model_path, trust_remote_code=trust_remote_code
+    )
 
-    ref_model = load_ref_model(model_path, adapter_mod=adapter) if need_ref else None
-    spyre_model = _load_spyre_model(model_path)
+    ref_model = (
+        load_ref_model(
+            model_path, adapter_mod=adapter, trust_remote_code=trust_remote_code
+        )
+        if need_ref
+        else None
+    )
+    spyre_model = _load_spyre_model(model_path, trust_remote_code=trust_remote_code)
     return model_path, tokenizer, ref_model, spyre_model
 
 
@@ -76,16 +100,26 @@ def _teardown(
     gc.collect()
 
 
-def run_greedy_case(model_path: str, case_id: str) -> tuple[bool, str]:
+def run_greedy_case(
+    model_path: str, case_id: str, trust_remote_code: bool | None = None
+) -> tuple[bool, str]:
     """Greedy-generate case: HF reference == Spyre output, per row."""
-    info, tokenizer, ref_model, model = _setup(model_path, need_ref=True)
+    info, tokenizer, ref_model, model = _setup(
+        model_path, need_ref=True, trust_remote_code=trust_remote_code
+    )
     try:
         targets, max_new = CASES[case_id]
         prompts = make_prompts(tokenizer, targets)
         hf_outputs = hf_reference_outputs(ref_model, tokenizer, prompts, max_new)
+        encoded = encode_generation_inputs(tokenizer, prompts)
         t0 = time.time()
-        spyre_outputs = model.generate(
-            tokenizer, prompts, max_new_tokens=max_new, do_sample=False
+        sequences = model.generate(
+            **encoded,
+            max_new_tokens=max_new,
+            do_sample=False,
+        )
+        spyre_outputs = tokenizer.batch_decode(
+            sequences[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
         )
         elapsed = time.time() - t0
         ok = all(hf.strip() == sp.strip() for hf, sp in zip(hf_outputs, spyre_outputs))
@@ -96,9 +130,13 @@ def run_greedy_case(model_path: str, case_id: str) -> tuple[bool, str]:
         _teardown(model, ref_model)
 
 
-def run_eos_case(model_path: str, case_id: str) -> tuple[bool, str]:
+def run_eos_case(
+    model_path: str, case_id: str, trust_remote_code: bool | None = None
+) -> tuple[bool, str]:
     """Forced-EOS case: shared eos_token_id stops each row at its requested offset."""
-    info, tokenizer, ref_model, model = _setup(model_path, need_ref=True)
+    info, tokenizer, ref_model, model = _setup(
+        model_path, need_ref=True, trust_remote_code=trust_remote_code
+    )
     try:
         eos_offsets, max_new = EOS_CASES[case_id]
         batch_size = len(eos_offsets)
@@ -114,13 +152,16 @@ def run_eos_case(model_path: str, case_id: str) -> tuple[bool, str]:
 
             pytest.skip("no clean shared eos token at requested offsets")
         expected = forced_eos_expected(per_prompt_ids, eos_offsets, tokenizer)
+        encoded = encode_generation_inputs(tokenizer, prompts)
         t0 = time.time()
-        out = model.generate(
-            tokenizer,
-            prompts,
+        sequences = model.generate(
+            **encoded,
             max_new_tokens=max_new,
             do_sample=False,
             eos_token_id=eos_id,
+        )
+        out = tokenizer.batch_decode(
+            sequences[:, encoded["input_ids"].shape[1] :], skip_special_tokens=True
         )
         elapsed = time.time() - t0
         ok = all(e.strip() == g.strip() for e, g in zip(expected, out))

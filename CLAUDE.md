@@ -19,11 +19,13 @@ bash tests/run_oot_module_configs.sh tests/configs/module_tests/  # run all conf
 python3 tests/test_e2e_smoke_spyre.py qwen3
 python3 tests/test_e2e_token_compare_spyre.py qwen3
 # Spyre tests (on pod only — requires torch_spyre). Pytest-parametrized off the
-# model registry; select one model with -k <key>, or run the file for all.
-pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k qwen3
-pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k qwen3
-pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py -k bge_base  # Text embedder
-pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py -k granite_vision_mm   # multimodal VLM
+# model registry; HF paths are test IDs. Use -k <path-substring> or --model-path.
+pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k "Qwen3-0.6B"                        # by path substring
+pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path Qwen/Qwen3-0.6B           # exact HF path
+pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-8b-instruct  # not in default collection
+pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py --model-path Qwen/Qwen3-0.6B
+pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py --model-path BAAI/bge-base-en-v1.5  # Text embedder
+pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py --model-path ibm-granite/granite-vision-4.1-4b   # multimodal VLM
 pytest -s -vvv tests/spyre/test_load_spyre.py    # Spyre load test
 ```
 
@@ -41,10 +43,10 @@ Every adapter follows the same pattern (see `hf_granite.py` as the canonical exa
 
 1. `_make_compiled_block(layer)` — closure over layer weights, returns `torch.compile(block_forward, dynamic=False)`
 2. `_run_forward(model, ...)` — embedding → RoPE → N compiled blocks → final norm → lm_head
-3. `prepare_for_spyre(model)` — patches RMSNorm, creates PrecomputedRotaryEmbedding, pads LM head, compiles blocks
+3. `prepare_for_spyre(model)` — creates PrecomputedRotaryEmbedding, pads LM head, compiles blocks, compiles the final norm (`model._spyre_compiled_norm`). RMSNorm is left as stock HF (PR #2927 lowers the fp32-upcast pattern inside compiled regions); Gemma is the exception via `_patch_gemma{3,4}_rmsnorm`.
 4. `load_model(model_path, dtype)` / `generate(model, tokenizer, prompts, **kwargs)` — thin wrappers
 
-Import shared utilities from `hf_common.py`: `PrecomputedRotaryEmbedding`, `apply_rope_matmul`, `kv_cache_update`, `patch_rmsnorm`, `pad_lm_head`, `pad_attention_heads`, `load_model_common`, `generate`.
+Import shared utilities from `hf_common.py`: `PrecomputedRotaryEmbedding`, `apply_rope_matmul`, `kv_cache_update`, `pad_lm_head`, `pad_attention_heads`, `load_model_common`, `generate`.
 
 ### Definition of Done (per adapter)
 

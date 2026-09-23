@@ -44,7 +44,8 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("EleutherAI/pythia-70m")
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-70m")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch
@@ -54,17 +55,16 @@ import torch.nn.functional as F
 from hf_adapters.hf_common import (
     BLOCK_SIZE,
     PrecomputedRotaryEmbedding,
-    _get_lm_head,
     _pad_proj_input_simple,
     _pad_proj_output_simple,
     apply_rope_matmul,
-    assert_spyre_dimensions,
     get_backbone,
     kv_cache_update,
-    pad_lm_head,
     pad_qk_proj_for_rope,
     permute_proj_for_rope,
+    prepare_lm_head_for_spyre,
     rope_dim_permutation,
+    run_lm_head,
 )
 
 # ---------------------------------------------------------------------------
@@ -233,8 +233,7 @@ def _run_forward(
         value_caches,
         cache_index,
     )
-    logits = model._spyre_lm_head(h)
-    return logits[..., : model.config.vocab_size]
+    return run_lm_head(model, h)
 
 
 def prepare_for_spyre(model):
@@ -245,10 +244,6 @@ def prepare_for_spyre(model):
     pads the LM head, and compiles one block per layer.
     """
     cfg = model.config
-    assert_spyre_dimensions(
-        cfg, model_name=getattr(cfg, "name_or_path", "") or "gpt-neox"
-    )
-
     bb = get_backbone(model)
     num_heads = cfg.num_attention_heads
     hidden = cfg.hidden_size
@@ -277,9 +272,11 @@ def prepare_for_spyre(model):
     )
 
     # GPT-NeoX named its output projection ``embed_out`` pre-transformers-5.14
-    # and ``lm_head`` from 5.14 on; _get_lm_head resolves either name.
-    pad_lm_head(model)
-    model._spyre_lm_head = _get_lm_head(model)
+    # and ``lm_head`` from 5.14 on; the shared helper resolves either name.
+    vocab_size = model.config.vocab_size
+    prepare_lm_head_for_spyre(
+        model, logits_processor=lambda logits: logits[..., :vocab_size]
+    )
 
     # Split fused QKV, apply permutation, pad if needed; register as submodules.
     model._spyre_q_projs = nn.ModuleList()

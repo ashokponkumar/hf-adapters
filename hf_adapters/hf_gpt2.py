@@ -41,17 +41,18 @@ Usage::
 
     model = AutoSpyreModelForCausalLM.from_pretrained("gpt2")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    outputs = model.generate(tokenizer, ["Hello!"], max_new_tokens=32)
+    encoded = tokenizer(["Hello!"], return_tensors="pt")
+    outputs = model.generate(**encoded, max_new_tokens=32)
 """
 
 import torch.nn as nn
 
 from hf_adapters.hf_common import (
-    assert_spyre_dimensions,
     get_backbone,
     make_decoder_block,
-    pad_lm_head,
     patch_new_gelu,
+    prepare_lm_head_for_spyre,
+    run_lm_head,
 )
 
 
@@ -186,8 +187,7 @@ def _run_forward(
         value_caches,
         cache_index,
     )
-    logits = model.lm_head(h)
-    return logits[..., : model.config.vocab_size]
+    return run_lm_head(model, h)
 
 
 def prepare_for_spyre(model):
@@ -199,8 +199,6 @@ def prepare_for_spyre(model):
     positions.
     """
     cfg = model.config
-    assert_spyre_dimensions(cfg, model_name=getattr(cfg, "name_or_path", "") or "gpt2")
-
     bb = get_backbone(model)
     embed_dim = cfg.n_embd
 
@@ -216,7 +214,10 @@ def prepare_for_spyre(model):
         layer.mlp.c_fc = _conv1d_to_linear(layer.mlp.c_fc)
         layer.mlp.c_proj = _conv1d_to_linear(layer.mlp.c_proj)
 
-    pad_lm_head(model)
+    vocab_size = model.config.vocab_size
+    prepare_lm_head_for_spyre(
+        model, logits_processor=lambda logits: logits[..., :vocab_size]
+    )
 
     # GPT-2 is MHA (kv heads == attention heads) and its config uses n_head /
     # n_embd rather than the standard num_key_value_heads / head_dim that

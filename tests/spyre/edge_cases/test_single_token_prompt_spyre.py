@@ -15,14 +15,19 @@
 """Spyre edge case: ``single_token_prompt`` (extreme left-padding)."""
 
 import pytest
-from _shared import run_greedy_case
-from model_registry import CAUSAL_PATHS
+
+from tests.model_registry import CAUSAL_PATHS
+from tests.spyre.edge_cases._shared import run_greedy_case
 
 pytestmark = pytest.mark.model_harness("causal")
 
 
 @pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
 @pytest.mark.slow
-def test_single_token_prompt_spyre(model_path: str) -> None:
-    ok, detail = run_greedy_case(model_path, "single_token_prompt")
+def test_single_token_prompt_spyre(
+    model_path: str, trust_remote_code: bool | None
+) -> None:
+    ok, detail = run_greedy_case(
+        model_path, "single_token_prompt", trust_remote_code=trust_remote_code
+    )
     assert ok, detail

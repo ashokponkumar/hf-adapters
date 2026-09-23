@@ -1,8 +1,7 @@
 # HF Adapters for Spyre
 
-![adapters](https://img.shields.io/badge/adapters-28-blue)
-![verified](https://img.shields.io/badge/verified_checkpoints-47-green)
-![compatible](https://img.shields.io/badge/compatible_models-100%2B-orange)
+![adapters](https://img.shields.io/badge/adapters-37-blue)
+![compatible](https://img.shields.io/badge/compatible_models-10K%2B-orange)
 
 Minimal runtime patches that make stock [HuggingFace Transformers](https://github.com/huggingface/transformers) models run on [Spyre](https://research.ibm.com/blog/ibm-spyre) accelerators.
 
@@ -14,15 +13,16 @@ from `transformers`.
 
 ## Supported Models
 
-**28 adapters · 47 verified checkpoints · 100+ compatible models**
+**37 adapters · 10K+ compatible models**
 
 Coverage spans **generative** (causal-LM), **embedding** (sentence-transformers),
+**sequence classification** (sentiment / text categorisation),
 **token classification** (NER/POS), **vision-language** (image→text), and
 **speculative-decoding drafter** models — from
 Llama / Qwen / Granite / Mistral / Phi / Gemma / OLMo / GPT decoders to BERT /
 XLM-RoBERTa / MPNet / ModernBERT encoders, the Granite Vision 4.1 (SigLIP tower +
 Granite text), Mistral3 Vision (Pixtral tower + Mistral text), and Gemma 4
-(encoder-free) multimodal VLMs, plus the DSpark block-propose drafters for
+(encoder-free and full-vision) multimodal VLMs, plus the DSpark block-propose drafters for
 Qwen 3 / Granite / Gemma 4.
 
 Each adapter covers all size variants and fine-tuned checkpoints sharing the same
@@ -58,13 +58,34 @@ from transformers import AutoTokenizer
 model = AutoSpyreModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-8b-instruct")
 tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.3-8b-instruct")
 
-outputs = model.generate(tokenizer, ["What is 2+2?"], max_new_tokens=128)
+inputs = tokenizer(["What is 2+2?"], return_tensors="pt", padding=True)
+sequences = model.generate(**inputs, max_new_tokens=5)
+outputs = tokenizer.batch_decode(
+    sequences[:, inputs["input_ids"].shape[1] :],
+    skip_special_tokens=True,
+)
 print(outputs[0])
 ```
 
-The `AutoSpyreModelForCausalLM` class automatically selects the correct adapter module based on the model's config type.
+The only change from a stock Hugging Face script is the model class —
+`AutoSpyreModelForCausalLM` instead of `AutoModelForCausalLM`. Tokenization,
+generation arguments, and decoding all work the same way.
 
-Note that `model.generate()` is a modified version of the stock HF `generate()` method, with a different signature and functionality (See [docs/generate_vs_stock_hf.md](docs/generate_vs_stock_hf.md)).
+`model.generate()` follows the stock Hugging Face input and basic tensor-output
+conventions, but supports a smaller set of generation features (see
+[docs/generate_vs_stock_hf.md](docs/generate_vs_stock_hf.md)).
+
+For instruct checkpoints, the convenience helper `encode_prompts()` applies the
+model's chat template automatically (or plain tokenizer post-processing for base
+models). It is recommended when you want canonical tokenization without manual
+template handling:
+
+```python
+from hf_adapters import AutoSpyreModelForCausalLM, encode_prompts
+
+inputs = encode_prompts(tokenizer, ["What is 2+2?"])
+sequences = model.generate(**inputs, max_new_tokens=5)
+```
 
 ## Embedding Models
 
@@ -138,6 +159,32 @@ Encoder task inputs must be right-padded. Masked-LM and question-answering
 support inference from `input_ids`; training/loss, `inputs_embeds`, attentions,
 and hidden-state collection are not currently supported.
 
+## Sequence Classification
+
+Use `AutoSpyreModelForSequenceClassification` for models that return a single
+label per input (sentiment analysis, topic classification, natural language
+inference). The encoder runs on Spyre; the classification head runs on CPU.
+Returns a standard HuggingFace `SequenceClassifierOutput` with
+`logits [B, num_labels]` on CPU:
+
+```python
+from transformers import AutoTokenizer
+from hf_adapters import AutoSpyreModelForSequenceClassification
+
+model_path = "distilbert/distilbert-base-uncased-finetuned-sst-2-english"
+tokenizer = AutoTokenizer.from_pretrained(model_path)
+model = AutoSpyreModelForSequenceClassification.from_pretrained(model_path)
+batch = tokenizer(
+    ["I really enjoyed this film!", "The plot was confusing and dull."],
+    return_tensors="pt",
+    padding=True,
+)
+outputs = model(**batch)
+label_ids = outputs.logits.argmax(dim=-1)
+labels = [model.config.id2label[i.item()] for i in label_ids]
+print(labels)  # → ['POSITIVE', 'NEGATIVE']
+```
+
 ## Token Classification (NER / POS)
 
 Use `AutoSpyreModelForTokenClassification` for token-level label prediction
@@ -178,8 +225,6 @@ from PIL import Image
 # --- Granite Vision 4.1 ---
 model = AutoSpyreModelForImageTextToText.from_pretrained("ibm-granite/granite-vision-4.1-4b")
 processor = AutoProcessor.from_pretrained("ibm-granite/granite-vision-4.1-4b")
-processor.tokenizer.padding_side = "left"  # matches the decode loop's right-aligned prompts
-
 # Build the batch the official way — the chat template tokenizes and expands the
 # image tokens in one call (the two-step text/images path mis-tiles anyres images).
 image = Image.open("cat.jpg").convert("RGB")
@@ -191,12 +236,9 @@ batch = processor.apply_chat_template(
     conv, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
 )
 
-texts = model.generate(
-    processor,
-    batch["input_ids"], batch["attention_mask"],
-    batch["pixel_values"], batch["image_sizes"],
-    max_new_tokens=64,
-)
+sequences = model.generate(**batch, max_new_tokens=64)
+prompt_len = batch["input_ids"].shape[1]
+texts = processor.batch_decode(sequences[:, prompt_len:], skip_special_tokens=True)
 print(texts[0])
 
 ```
@@ -205,8 +247,9 @@ A multimodal checkpoint's config is registered under both auto classes:
 `AutoSpyreModelForCausalLM` selects the text-only adapter (vision tower
 discarded), while `AutoSpyreModelForImageTextToText` selects the combined
 multimodal adapter. This works for Granite Vision (`Granite4VisionConfig`),
-Mistral3 Vision (`Mistral3Config`), and Gemma 4 (`Gemma4UnifiedConfig`, an
-encoder-free VLM — no vision tower; see [ARCHITECTURE.md](ARCHITECTURE.md#multimodal-vlm-path-vision-tower--text-decoder)).
+Mistral3 Vision (`Mistral3Config`), and Gemma 4 (`Gemma4UnifiedConfig` for the
+encoder-free variant, or `Gemma4Config` for the full vision-tower variants; see
+[ARCHITECTURE.md](ARCHITECTURE.md#multimodal-vlm-path-vision-tower--text-decoder)).
 
 ## Repo Structure
 
@@ -234,6 +277,7 @@ tests/                                 CPU tests (no Spyre required)
     ├── test_e2e_smoke_spyre.py        E2E: load + generate on Spyre
     ├── test_e2e_token_compare_spyre.py E2E: HF CPU vs adapter Spyre tokens
     ├── test_e2e_embed_compare_spyre.py E2E: HF CPU vs adapter Spyre embeddings
+    ├── test_e2e_seq_classification_compare_spyre.py E2E: HF CPU vs adapter Spyre seq-classification logits
     ├── test_vlm_e2e_spyre.py          E2E: multimodal adapter on Spyre (teacher-forced)
     └── test_load_spyre.py             Spyre: models load without errors
 ```
@@ -279,23 +323,29 @@ uv run pytest tests/test_load_cpu.py                              # CPU load tes
 ### Spyre Tests (requires Spyre hardware)
 
 The Spyre lane lives under `tests/spyre/` and is also pytest-driven (not
-`python tests/...`). Each test is parametrized off the model registry, so a
-single model is selected with `-k <key>` (e.g. `granite2b`, `qwen3`, `bge_base`).
-Run the whole file to cover every registered model. Run from the repository root.
+`python tests/...`). Each test is parametrized off the model registry using
+HF paths as test IDs. Select a specific model with `-k <path-substring>` or
+`--model-path <hf-path>`. Run from the repository root.
+
+> **Note:** Inside a Spyre container where a virtualenv is already active, drop
+> the `uv run` prefix and use `pytest` directly (e.g.
+> `pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ...`).
 
 ```bash
 # E2E smoke test (real weights, verify non-trivial output)
-uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py                  # one representative model per adapter
-uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k granite2b     # one model
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py                                                   # one representative model per adapter
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py -k "granite-3.3-2b"                               # one model by path substring
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-2b-instruct  # exact model by HF path
+uv run pytest -s -vvv tests/spyre/test_e2e_smoke_spyre.py --model-path ibm-granite/granite-3.3-8b-instruct  # model not in default collection
 
 # E2E token comparison (HF CPU vs adapter Spyre, per-step greedy tokens)
-uv run pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k granite2b
+uv run pytest -s -vvv tests/spyre/test_e2e_token_compare_spyre.py -k "granite-3.3-2b"
 
 # E2E embedding comparison (HF CPU vs adapter Spyre, hidden-states cosine)
-uv run pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py -k bge_base
+uv run pytest -s -vvv tests/spyre/test_e2e_embed_compare_spyre.py -k "bge-base"
 
 # E2E multimodal VLM (image→text; teacher-forced per-step logit comparison)
-uv run pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py -k granite_vision_mm
+uv run pytest -s -vvv tests/spyre/test_vlm_e2e_spyre.py -k "granite-vision"
 
 # Load test (verify a model loads on Spyre without errors)
 uv run pytest -s -vvv tests/spyre/test_load_spyre.py
@@ -304,10 +354,10 @@ uv run pytest -s -vvv tests/spyre/test_load_spyre.py
 `-s -vvv` matches each test's documented usage and shows the per-step comparison
 tables the token / embedding / VLM tests print.
 
-Note: Spyre has known numerical accuracy limitations. Greedy token mismatches
-between CPU and Spyre are expected on the single-token decode path until
-torch\_spyre fixes land — which is why the VLM lane asserts a per-step logit
-cosine floor rather than exact tokens (see
+Numerical gating depends on the workload. The blocking causal token-comparison
+lane requires exact greedy top-1 agreement with CPU over prefill and four decode
+steps. The VLM lane instead asserts a per-step logit cosine floor because its
+open-ended caption prompts can produce near-tied top-1 candidates (see
 [ARCHITECTURE.md](ARCHITECTURE.md#vision-language-imagetext)).
 
 ## Development

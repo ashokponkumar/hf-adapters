@@ -19,17 +19,33 @@ This test ensures that every hf_*.py adapter file has at least one corresponding
 entry in either CAUSAL_LM_MODELS or EMBEDDING_MODELS dictionaries.
 """
 
+import ast
 from pathlib import Path
 
 from tests.model_registry import (
     CAUSAL_LM_MODELS,
+    CAUSAL_PATHS,
     EMBEDDING_MODELS,
     MASKED_LM_MODELS,
+    NON_BLOCKING_CAUSAL_MODELS,
     QUESTION_ANSWERING_MODELS,
     RERANKER_MODELS,
+    SEQ_CLASSIFICATION_MODELS,
     TOKEN_CLASSIFICATION_MODELS,
     VISION_MODELS,
 )
+
+
+def test_always_test_causal_models_are_enabled_and_blocking():
+    """Every ``always_test`` causal model must gate the default test matrix."""
+    always_test_paths = {
+        info["path"]
+        for info in CAUSAL_LM_MODELS.values()
+        if info.get("always_test", False)
+    }
+
+    assert always_test_paths <= set(CAUSAL_PATHS)
+    assert always_test_paths.isdisjoint(NON_BLOCKING_CAUSAL_MODELS)
 
 
 def get_adapter_files():
@@ -99,6 +115,12 @@ def get_registered_adapters():
         if adapter:
             registered_adapters.add(adapter)
 
+    # Collect adapters from SEQ_CLASSIFICATION_MODELS
+    for model_info in SEQ_CLASSIFICATION_MODELS.values():
+        adapter = model_info.get("adapter")
+        if adapter:
+            registered_adapters.add(adapter)
+
     # Collect adapters from TOKEN_CLASSIFICATION_MODELS
     for model_info in TOKEN_CLASSIFICATION_MODELS.values():
         adapter = model_info.get("adapter")
@@ -159,6 +181,85 @@ def test_no_invalid_adapter_references():
     )
 
 
+def test_vlm_adapters_implement_generation_hooks():
+    """Ensure every VLM adapter implements the generic generation protocol."""
+    required_functions = {"_prefill_forward", "_logits_from_embeds"}
+    required_metadata = {
+        "_GENERATION_INPUT_NAMES",
+        "_GENERATION_TOKEN_ALIGNED_INPUTS",
+    }
+    adapter_files = {
+        info["adapter"] for info in VISION_MODELS.values() if info.get("kind") == "vlm"
+    }
+    adapter_dir = Path(__file__).parent.parent / "hf_adapters"
+
+    for adapter_file in adapter_files:
+        tree = ast.parse((adapter_dir / adapter_file).read_text())
+        functions = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        metadata = {
+            target.id
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        metadata.update(
+            node.target.id
+            for node in tree.body
+            if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+        )
+        missing = (required_functions - functions) | (required_metadata - metadata)
+        assert not missing, (
+            f"{adapter_file} is missing VLM generation protocol members "
+            f"{sorted(missing)}"
+        )
+
+
+def test_standard_gqa_adapters_prepare_lm_head():
+    """Every adapter using the shared causal forward must install its LM head."""
+    adapter_dir = Path(__file__).parent.parent / "hf_adapters"
+    valid_setup_calls = {"prepare_lm_head_for_spyre", "prepare_standard_gqa"}
+
+    for adapter_path in adapter_dir.glob("hf_*.py"):
+        tree = ast.parse(adapter_path.read_text())
+        uses_standard_forward = any(
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_run_forward"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "standard_gqa_forward"
+            for node in tree.body
+        )
+        if not uses_standard_forward:
+            continue
+
+        prepare = next(
+            (
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "prepare_for_spyre"
+            ),
+            None,
+        )
+        assert prepare is not None, f"{adapter_path.name} has no prepare_for_spyre"
+        calls = {
+            node.func.id
+            for node in ast.walk(prepare)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert calls & valid_setup_calls, (
+            f"{adapter_path.name} uses standard_gqa_forward but prepare_for_spyre "
+            "does not install the shared LM-head callable"
+        )
+
+
 def test_adapter_coverage_details():
     """
     Provide detailed information about adapter coverage for debugging.
@@ -177,6 +278,7 @@ def test_adapter_coverage_details():
         + list(QUESTION_ANSWERING_MODELS.values())
         + list(VISION_MODELS.values())
         + list(RERANKER_MODELS.values())
+        + list(SEQ_CLASSIFICATION_MODELS.values())
         + list(TOKEN_CLASSIFICATION_MODELS.values())
     ):
         adapter = model_info.get("adapter")

@@ -32,11 +32,12 @@ from PIL import Image
 from transformers import AutoProcessor
 
 from tests.conftest import load_ref_model
+from tests.model_registry import REMOTE_CODE_PATHS
 
 # ── VLM (image→text) end-to-end helpers ──────────────────────────────────────
 #
 # These drive a full multimodal adapter (both towers) the way an application
-# would: processor → adapter.generate → decoded text, compared against stock's
+# would: processor → bound model.generate → decoded text, compared against stock's
 # real ``model.generate``. They are model-agnostic given a model path — the only
 # convention they bake in is the modern single-call chat-template path, which
 # every current HF VLM processor supports and which (for anyres VLMs like Granite
@@ -50,6 +51,49 @@ SAMPLE_IMAGE = {
     "repo_type": "dataset",
 }
 
+# Registry of diverse sample images for multi-image smoke tests.
+# All sourced from the public ``huggingface/documentation-images`` dataset —
+# no local files required; each is downloaded on first use and cached by
+# ``huggingface_hub``.  Each entry carries a short ``label`` (used in test
+# output) and a ``prompt`` suited to the scene.
+SMOKE_TEST_IMAGES: list[dict] = [
+    {
+        "label": "cat",
+        "repo_id": "huggingface/documentation-images",
+        "filename": "pipeline-cat-chonk.jpeg",
+        "repo_type": "dataset",
+        "prompt": "Describe what you see in this image.",
+    },
+    {
+        "label": "bee",
+        "repo_id": "huggingface/documentation-images",
+        "filename": "bee.jpg",
+        "repo_type": "dataset",
+        "prompt": "What type of insect is shown in the image?",
+    },
+    {
+        "label": "car",
+        "repo_id": "huggingface/documentation-images",
+        "filename": "transformers/tasks/car.jpg",
+        "repo_type": "dataset",
+        "prompt": "What type of vehicle is shown in this image?",
+    },
+    {
+        "label": "rabbit",
+        "repo_id": "huggingface/documentation-images",
+        "filename": "transformers/rabbit.png",
+        "repo_type": "dataset",
+        "prompt": "Describe the animal in this image.",
+    },
+    {
+        "label": "owl",
+        "repo_id": "huggingface/documentation-images",
+        "filename": "transformers/tasks/owl.jpg",
+        "repo_type": "dataset",
+        "prompt": "What do you see in this image?",
+    },
+]
+
 
 def _load_sample_image() -> Image.Image:
     """A real, recognizable hub image (a chonky cat) so a caption is judgeable.
@@ -59,6 +103,24 @@ def _load_sample_image() -> Image.Image:
     """
     path = hf_hub_download(**SAMPLE_IMAGE)
     return Image.open(path).convert("RGB")
+
+
+def load_smoke_test_images() -> list[tuple[str, str, Image.Image]]:
+    """Download and return all SMOKE_TEST_IMAGES as (label, prompt, image) tuples.
+
+    Each image is downloaded from the HF hub on first call and cached locally
+    by ``huggingface_hub`` — subsequent calls are instant (no re-download).
+    """
+    results = []
+    for entry in SMOKE_TEST_IMAGES:
+        path = hf_hub_download(
+            repo_id=entry["repo_id"],
+            filename=entry["filename"],
+            repo_type=entry["repo_type"],
+        )
+        image = Image.open(path).convert("RGB")
+        results.append((entry["label"], entry["prompt"], image))
+    return results
 
 
 def extra_image_inputs(fn, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -85,6 +147,7 @@ def build_vlm_batch(
     model_path: str,
     prompt: str,
     image: Image.Image | None = None,
+    trust_remote_code: bool | None = None,
 ) -> tuple[AutoProcessor, dict[str, torch.Tensor]]:
     """Processor + tokenized (image + prompt) batch, the official VLM way.
 
@@ -97,11 +160,16 @@ def build_vlm_batch(
     convention. Returns ``(processor, batch)``; ``batch`` carries whatever image
     inputs the model needs (``pixel_values``, ``image_sizes``, …).
     """
+    if trust_remote_code is None:
+        trust_remote_code = model_path in REMOTE_CODE_PATHS
     if "mistral" in model_path.lower():
-        processor = AutoProcessor.from_pretrained(model_path, fix_mistral_regex=True)
+        processor = AutoProcessor.from_pretrained(
+            model_path, fix_mistral_regex=True, trust_remote_code=trust_remote_code
+        )
     else:
-        processor = AutoProcessor.from_pretrained(model_path)
-    # processor = AutoProcessor.from_pretrained(model_path)
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
     processor.tokenizer.padding_side = "left"
 
     if image is None:
@@ -132,6 +200,7 @@ def stock_vlm_generate(
     adapter_mod,
     max_new_tokens: int,
     ref_model=None,
+    trust_remote_code: bool | None = None,
 ) -> str:
     """Reference: stock ``AutoModelForImageTextToText.generate`` on ``batch``.
 
@@ -146,6 +215,7 @@ def stock_vlm_generate(
         ref_model = load_ref_model(
             model_path=model_path,
             adapter_mod=adapter_mod,
+            trust_remote_code=trust_remote_code,
             auto_model_cls=AutoModelForImageTextToText,
         )
 

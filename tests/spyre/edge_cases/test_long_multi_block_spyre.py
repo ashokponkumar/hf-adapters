@@ -15,14 +15,19 @@
 """Spyre edge case: ``long_multi_block`` (prompt > one block)."""
 
 import pytest
-from _shared import run_greedy_case
-from model_registry import CAUSAL_PATHS
+
+from tests.model_registry import CAUSAL_PATHS
+from tests.spyre.edge_cases._shared import run_greedy_case
 
 pytestmark = pytest.mark.model_harness("causal")
 
 
 @pytest.mark.parametrize("model_path", CAUSAL_PATHS, ids=CAUSAL_PATHS)
 @pytest.mark.slow
-def test_long_multi_block_spyre(model_path: str) -> None:
-    ok, detail = run_greedy_case(model_path, "long_multi_block")
+def test_long_multi_block_spyre(
+    model_path: str, trust_remote_code: bool | None
+) -> None:
+    ok, detail = run_greedy_case(
+        model_path, "long_multi_block", trust_remote_code=trust_remote_code
+    )
     assert ok, detail

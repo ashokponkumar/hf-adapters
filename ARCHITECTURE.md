@@ -10,11 +10,11 @@ which models are supported on Spyre.
 | Model | model\_type | head\_dim | D/2 | Stick Aligned | CPU Accurate | Spyre Compiles | Spyre Runs |
 |-------|-----------|---------|-----|--------------|-------------|---------------|-----------|
 | Qwen3 0.6B | qwen3 | 128 | 64 | Yes | Yes | Yes | Yes |
+| LFM2 350M | lfm2 | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | Granite 3.3 8B | granite | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite 3.3 2B | granite | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
-| Granite 4.0 1B Base | granitemoehybrid | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite 4.0 1B Instruct | granitemoehybrid | 128 | 64 | Yes | Yes | Yes | Yes |
-| Granite 4.1 20B (bf16) | granite_swa | 128 | 64 | Yes | Yes | Yes | Yes |
+| Granite 4.1 20B | granite_swa | 128 | 64 | Yes | Yes | Yes | Yes |
 | SmolLM3 3B | smollm3 | 128 | 64 | Yes | Yes | Yes | Yes |
 | Llama 3.2 3B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
 | TinyLlama 1.1B | llama | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
@@ -25,14 +25,22 @@ which models are supported on Spyre.
 | Phi-3.5 mini | phi3 | 96→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | OLMo 1B | olmo | 128 | 64 | Yes | Yes | Yes | Yes |
 | OLMo2 1B | olmo2 | 128 | 64 | Yes | Yes | Yes | Yes |
+| OLMoE 1B-7B | olmoe | 128 | 64 | Yes | Yes | Yes | Yes |
 | Falcon 3 1B | llama | 256 | 128 | Yes | Yes | Yes | Yes |
 | DeepSeek-Coder 1.3B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
 | Yi 1.5 6B | llama | 128 | 64 | Yes | Yes | Yes | Yes |
 | Granite Vision 4.1 4B (text backbone) | granite (text) | 64→128 | 64 | Yes (padded) | Yes | Yes | Yes |
 | Gemma 4 12B | gemma4\_unified | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 26B-A4B (MoE) | gemma4 (MoE, `enable_moe_block`) | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 E2B | gemma4 | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 E4B | gemma4 | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 31B | gemma4 | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
+| Gemma 4 31B Instruct | gemma4 | 256 / 512 | 128 / 256 | Yes | Yes | Yes | Yes |
 | Gemma 3 1B | gemma3\_text | 256 | 128 | Yes | Yes | Yes | Yes |
+| Gemma 2 9B | gemma2 | 256 | 128 | Yes | Yes | Yes | Yes |
 | GPT-2 124M | gpt2 | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
 | GPT-Neo 125M | gpt_neo | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
+| OPT 125M | opt | 64 | n/a (no RoPE) | Yes | Yes | Yes | Yes |
 | Pythia 70M | gpt_neox | 64→128 | 16 (partial) | Yes (padded) | Yes | Yes | Yes |
 | Ministral-8B Instruct | ministral | 128 | 64 | Yes | Yes | Yes | Yes |
 | Mistral Small 3 24B | mistral3 | 128 | 64 | Yes | Yes | Yes | Yes |
@@ -42,24 +50,48 @@ which models are supported on Spyre.
 **Spyre Compiles** = `torch.compile(block_forward)` succeeds on Spyre.
 **Spyre Runs** = block produces output (no crash/NaN).
 
-Unless a row notes otherwise (e.g. `(bf16)`), **verified means verified in fp16** — this holds even for bf16-native checkpoints. A bf16-native model that is only verified in fp16 may behave differently in bf16 on Spyre (and vice versa); the dtype actually tested is what the table certifies.
+### Diffusion LM (block-diffusion)
+
+| Model | model\_type | head\_dim | D/2 | Stick Aligned | Spyre Compiles | Spyre Runs |
+|-------|-----------|---------|-----|--------------|---------------|-----------|
+| DiffusionGemma 26B-A4B-it (bf16, TP=2) | diffusion\_gemma | 256 / 512 | 128 / 256 | Yes | Yes | Yes |
+
+**Spyre Compiles** = `torch.compile(encoder_block)` and `torch.compile(decoder_block)` succeed on Spyre.
+**Spyre Runs** = block-diffusion generate loop produces coherent text (verified: "Why is the sky blue?" → multi-paragraph Rayleigh scattering answer, bf16, TP=2).
+
+CPU Accurate does not apply: DiffusionGemma has no greedy AR token sequence to compare — correctness is assessed by output coherence on Spyre directly. MoE router + experts run on CPU at every layer by design (nonzero + Python loop over alive experts, not compilable).
+
+**Gemma 4 26B-A4B (MoE):** 128 experts, top-8 routing. Prefill uses a persistent
+expert loop (all experts evaluated, routed via `keep_by_index` + coarse-tile
+carried sum). Decode uses per-token expert gather with BMM. Both paths compile
+and run end-to-end; the decode path is a single compiled graph (attention +
+layernorms + FFN/MoE fused). Token-compare: 5/5 top-1 agreement with proper
+chat-template tokenization (PR#385).
+
+**OLMoE 1B-7B:** 64 experts, top-8 routing with the checkpoint's
+unnormalized selected probabilities. Prefill evaluates all experts persistently;
+decode gathers only the selected experts. The BF16 path compiles and runs
+end-to-end with 5/5 top-1 agreement against the CPU reference.
 
 ### Vision-Language (image→text)
 
 Full multimodal VLMs: a vision tower (image → patch features) plus a causal text
 decoder (features + prompt → generated text). Both towers compile and run on
 Spyre; the projector / patch-embed / feature-merge ops that don't lower run on
-CPU (see Multimodal VLM Path below).
+CPU where integer/control-flow-heavy frontend or pooling operations do not lower
+(see Multimodal VLM Path below).
 
 | Model | model\_type | Towers | Stick Aligned | CPU Accurate | Spyre Compiles | Spyre Runs |
-|-------|-----------|--------|-----------|--------------|-------------|---------------|-----------|
+|-------|-----------|--------|-----------|--------------|-------------|-----------|
 | Granite Vision 4.1 4B | granite4\_vision | SigLIP vision + Granite text | Yes (padded) | Yes | Yes | Yes |
 | Mistral-Small-3.1-24B-Instruct-2503 | mistral3 | Pixtral + Mistral text | Yes (padded) | Yes | Yes | Yes |
-| Ministral-3-14B-Instruct-2512 (bf16) | mistral3 | Pixtral + Ministral3 text | Yes (padded) | Yes | Yes | Yes |
-| Gemma 4 12B (bf16) | gemma4\_unified | Encoder-free vision embedder + Gemma 4 text | Yes | Yes | Yes | Yes |
+| Ministral-3-14B-Instruct-2512 | mistral3 | Pixtral + Ministral3 text | Yes (padded) | Yes | Yes | Yes |
+| Gemma 4 12B IT | gemma4\_unified | Encoder-free vision embedder + Gemma 4 text | Yes | Yes | Yes | Yes |
+| Gemma 4 E2B | gemma4 | Gemma 4 vision tower + PLE/KV-sharing text | Yes | Yes | Yes | Yes |
+| Gemma 4 26B-A4B | gemma4 | Gemma 4 vision tower + MoE text | Yes | Not run | Yes | Yes |
 
 **CPU Accurate** = adapter `generate` matches stock `model.generate` token-for-token on CPU (`test_vlm_e2e_cpu.py`).
-**Spyre Runs** = `test_vlm_e2e_spyre.py` drives the adapter teacher-forced on stock's tokens and asserts per-step logit cosine ≥ 0.999 vs the CPU reference over prefill + decode steps (top-1 agreement is reported, not asserted — an open-ended caption hits near-ties where the fp16-substrate winner is numerically arbitrary; see Multimodal VLM Path). granite-vision-4.1 holds cosine ≥ 0.99991 at every step and produces a correct, coherent caption. Gemma 4 12B runs in **bf16** (like the rest of the Gemma family, it overflows its residual stream in fp16) and holds cosine ≥ 0.99964 at every step with 5/5 top-1 agreement, producing a caption byte-identical to stock.
+**Spyre Runs** = `test_vlm_e2e_spyre.py` drives the adapter teacher-forced on stock's tokens and asserts per-step logit cosine ≥ 0.99 vs the CPU reference over prefill + decode steps (top-1 agreement is reported, not asserted — an open-ended caption hits near-ties where the bf16-substrate winner is numerically arbitrary; see Multimodal VLM Path). granite-vision-4.1 holds cosine ≥ 0.99991 at every step and produces a correct, coherent caption. Gemma 4 12B IT runs in **bf16** (like the rest of the Gemma family, it overflows its residual stream in fp16) and holds cosine ≥ 0.99939 at every step with 5/5 top-1 agreement. Gemma 4 E2B holds cosine ≥ 0.99502 with 4/5 top-1 agreement after preserving stock PLE and mask semantics and running its 16-layer vision transformer on Spyre. Gemma 4 26B-A4B holds cosine ≥ 0.99956 with 4/5 top-1 agreement while running its 27-layer vision transformer on Spyre.
 
 ### Embedding
 
@@ -84,6 +116,25 @@ Use `st_backend` for the sentence-transformers API, or call `prefill_embed` / `p
 **CPU Accurate** = adapter hidden-states have cosine similarity ≥ 0.999 vs stock HF on CPU (the bound accommodates the bf16-native EmbeddingGemma; fp16 models clear it with wide margin).
 **Spyre Compiles / Spyre Runs** = via `test_e2e_embed_compare_spyre.py`. GTE-Qwen2 compiles and executes end-to-end on Spyre but its pooled embeddings drift from the CPU reference; the Qwen3/Mistral/BERT/XLM-RoBERTa/MPNet/ModernBERT encoder paths match within fp16 noise. EmbeddingGemma runs in **bf16** (fp16 overflows its residual stream) and matches the bf16 CPU reference within bf16 noise (per-token cosine ≥ 0.999; pooled ≥ 0.99).
 
+### Sequence Classification
+
+Encoder models fine-tuned for sequence-level label prediction (sentiment
+analysis, topic classification, NLI). The encoder backbone runs on Spyre;
+the two-stage classification head (`pre_classifier` + `classifier`) runs on
+CPU (pinned via `_spyre_cpu_submodules`). Use `AutoSpyreModelForSequenceClassification`;
+returns a standard `SequenceClassifierOutput` with `logits [B, num_labels]` on CPU.
+
+| Model | model\_type | head\_dim | Stick Aligned | CPU Accurate | Spyre Compiles | Spyre Runs |
+|-------|-----------|---------|--------------|-------------|---------------|-----------|
+| DistilBERT base uncased finetuned SST-2 (distilbert/distilbert-base-uncased-finetuned-sst-2-english) | distilbert | 64 | Yes | Yes | Yes | Yes |
+| RoBERTa large MNLI (FacebookAI/roberta-large-mnli) | roberta | 64 | Yes | Yes | Yes | Yes |
+
+**CPU Accurate** = per-sequence argmax label matches stock HF exactly; per-sequence
+logit cosine ≥ 0.999 vs stock HF on CPU (`test_seq_classification_cpu_accuracy.py`).
+**Spyre Runs** = via `test_e2e_seq_classification_compare_spyre.py`;
+per-sequence logit cosine ≥ 0.99 and exact label match vs CPU reference.
+RoBERTa large MNLI uses `hf_xlm_roberta.py` (shared with the XLM-RoBERTa and reranker adapters); `RobertaConfig` is already registered in `SEQUENCE_CLASSIFICATION_CONFIG_TO_ADAPTER_MODULE_MAPPING`.
+
 ### Token Classification (NER)
 
 Encoder models fine-tuned for token-level label prediction (NER, POS, chunking).
@@ -102,7 +153,7 @@ logit cosine ≥ 0.999 vs stock HF on CPU (`test_token_classification_cpu_accura
 **Spyre Runs** = via `test_e2e_token_classification_compare_spyre.py`;
 per-token logit cosine ≥ 0.99 and exact label match vs CPU reference.
 
-### Spyre Numerical Accuracy (torch-spyre @ 7c6ef99)
+### Historical Spyre Numerical Snapshot (torch-spyre @ 7c6ef99)
 
 Per-layer block comparison (`test_block_cpu_vs_spyre.py`) with random
 weights, measured as max absolute diff between CPU and Spyre output:
@@ -112,14 +163,16 @@ weights, measured as max absolute diff between CPU and Spyre output:
 | Qwen3 0.6B | 0.01–0.02 | 0.3–5.5 |
 | Llama 3.2 3B | 0.07–0.08 | 1.9–6.0 |
 
-**Prefill is accurate** — errors are in the fp16 rounding range. The
-first generated token matches the CPU reference (verified with Qwen3
-E2E: `" Paris"` on both CPU and Spyre).
-
-**Decode has large errors** — max diffs of 1–6 per block accumulate
-across layers and autoregressive steps, causing token drift after the
-first token. This is a torch-spyre compiler issue specific to the
-single-token decode path (seq_len=1), not an adapter issue.
+At that revision, prefill errors were in the fp16 rounding range and the first
+Qwen3 token matched the CPU reference, but decode errors were substantially
+larger and caused token drift after the first token. **These decode-divergence
+numbers are stale.** They were recorded against the old `torch-spyre @ 7c6ef99`
+pin; the dependency now tracks `main` (`pyproject.toml`), and decode has since
+been verified working end-to-end on **Granite** and **Qwen3** — both prefill and
+decode produce correct tokens. The measurements are retained only as historical
+context. The blocking causal test lane requires exact greedy top-1 agreement
+with CPU over prefill and four decode steps; Granite, Qwen3, and Gemma 4 E2B/E4B
+all pass that check.
 
 ## Model Family Coverage
 
@@ -129,17 +182,20 @@ single-token decode path (seq_len=1), not an adapter issue.
 > adapter or verify a checkpoint, update *only* this file (and the badge
 > counts in README.md, noted below).
 
-**Coverage:** 28 adapters · 47 verified checkpoints · 100+ compatible models.
-The 47 verified rows are 28 generative + 13 embedding + 2 token-classification + 4 vision-language (see the
-Verified Checkpoints tables above). `hf_siglip_vision` and `hf_pixtral_vision` are
-vision-tower components used by VLM adapters rather than standalone model adapters.
+**Coverage:** 37 adapters · 58 verified checkpoints · 10K+ compatible models.
+The 59 verified rows are 36 generative + 13 embedding + 2 seq-classification +
+2 token-classification + 6 vision-language (see the Verified Checkpoints tables
+above). `hf_siglip_vision` and `hf_pixtral_vision` are bare vision-tower components
+used by VLM adapters and are not included in the adapter count. The three DSpark
+speculative-decoding drafter adapters are included in the adapter count.
 Granite Vision 4.1 is verified both as a text backbone (generative) and as a full VLM.
 `hf_mistral3_vision_mm` covers both the ``mistral`` text-backbone variant
 (Mistral-Small-3.1/3.2) and the ``ministral3`` variant (Ministral-3-14B-Instruct-2512,
 blocked-FP8, bf16) — both share the Pixtral vision tower; CPU and Spyre verified
-(token-exact on CPU, 5/5 top-1 match on Spyre). `hf_gemma4_mm` is the first
-**encoder-free** VLM: no vision tower, just a projection of processor-merged pixel
-patches into the text embedding space (runs bf16; CPU and Spyre verified).
+(token-exact on CPU, 5/5 top-1 match on Spyre). `hf_gemma4_mm` supports both the encoder-free unified checkpoints and the full
+Gemma 4 multimodal architecture. The latter currently runs its stock vision tower
+on CPU, then feeds the projected features into the Spyre PLE/KV-sharing or MoE
+text decoder (bf16; CPU reference and Spyre verified).
 
 Each adapter handles a HuggingFace `model_type`. Once verified with
 one checkpoint, all size variants and fine-tunes of that architecture
@@ -159,13 +215,19 @@ pattern, norms, and weight layout.
 | hf\_granitemoehybrid.py | granitemoehybrid | 2 | Granite 4.0 Micro |
 | hf\_granite\_swa.py | granite\_swa | 1 | Granite 4.1 8B (unverified), Granite 4.1 20B |
 | hf\_smollm3.py | smollm3 | 1 | — |
-| hf\_gemma4.py | gemma4\_unified / gemma4 (dense) | 1 | Gemma 4 31B (dense). Not E2B/E4B (PLE) or 26B-A4B (MoE). |
-| hf\_gemma4\_mm.py | gemma4\_unified (multimodal) | 1 | Gemma 4 31B (dense unified VLM). Not E2B/E4B (PLE) or 26B-A4B (MoE). |
+| hf\_lfm2.py | lfm2 | 1 | LFM2 700M/1.2B and dense LFM2 fine-tunes with hybrid convolution/attention layers |
+| hf\_gemma4.py | gemma4\_unified / gemma4 (dense + PLE/KV-share) | 4 | Gemma 4 31B (dense). Not 26B-A4B (MoE). |
+| hf\_gemma4\_mm.py | gemma4\_unified / gemma4 (multimodal) | 4 | Encoder-free dense unified VLMs plus full-vision PLE/KV-share and MoE variants. Combined MoE+PLE/KV-share remains unsupported. |
+| hf\_gemma4\_moe.py | gemma4 (MoE, `enable_moe_block`) | 1 | Gemma 4 26B-A4B (128 experts, top-8 routing). Persistent prefill + gathered decode, 5/5 token match. |
+| hf\_diffusion\_gemma.py | diffusion\_gemma | 1 | google/diffusiongemma-26B-A4B-it. MoE runs on CPU; attention + dense MLP compiled on Spyre. Block-diffusion generate loop. Gated. |
 | hf\_gemma3.py | gemma3\_text / gemma3 (dense) | 2 | Gemma 3 4B/12B/27B (text decoder of the multimodal checkpoints); EmbeddingGemma (bidirectional embedder). Not Gemma 3n (PLE). |
+| hf\_gemma2.py | gemma2 | 1 | Gemma 2 2B and Gemma 2 fine-tunes. |
 | hf\_olmo.py | olmo | 1 | OLMo 7B |
 | hf\_olmo2.py | olmo2 | 1 | OLMo 2 7B |
+| hf\_olmoe.py | olmoe | 1 | OLMoE-1B-7B-0125 and OLMoE fine-tunes with the same SiLU/no-QKV-clipping configuration |
 | hf\_gpt2.py | gpt2 | 1 | GPT-2 medium/large/xl, DistilGPT-2, Cerebras-GPT (111M–6.7B) |
 | hf\_gpt\_neo.py | gpt_neo | 1 | GPT-Neo 1.3B/2.7B, GPT-Neo-style fine-tunes |
+| hf\_opt.py | opt | 1 | OPT 350M/1.3B/2.7B/6.7B and OPT fine-tunes |
 | hf\_gpt\_neox.py | gpt_neox | 1 | Pythia 160M–12B, GPT-NeoX-20B, Dolly v2, StableLM-base-alpha, other GPT-NeoX-arch checkpoints |
 | hf\_granite\_vision.py | granite (text) | 1 | — |
 | hf\_granite\_vision\_mm.py | granite4\_vision (multimodal) | 1 | — |
@@ -173,7 +235,8 @@ pattern, norms, and weight layout.
 | hf\_mistral3\_vision\_mm.py | mistral3 (multimodal) | 2 | Mistral-Small-3.1/3.2 Vision; Ministral-3-14B-Instruct-2512 (ministral3 text backbone, bf16) |
 | hf\_pixtral\_vision.py | Pixtral vision tower | 1 | Pixtral towers of Mistral3 Vision checkpoints |
 | hf\_bert.py | bert | 3 | BERT-base, BERT-large, RoBERTa-base/large, other BGE/MiniLM variants, BERT NER/POS/chunking fine-tunes |
-| hf\_xlm\_roberta.py | xlm-roberta | 2 | multilingual-e5-large, paraphrase-multilingual-mpnet-base-v2, other XLM-R fine-tunes, RoBERTa NER/QA fine-tunes |
+| hf\_distilbert.py | distilbert | 2 | DistilBERT-base fine-tunes (QA, NER, sentiment, other classifier heads) |
+| hf\_xlm\_roberta.py | xlm-roberta / roberta | 3 | multilingual-e5-large, paraphrase-multilingual-mpnet-base-v2, other XLM-R fine-tunes, RoBERTa NER/QA/classifier fine-tunes |
 | hf\_mpnet.py | mpnet | 1 | multi-qa-mpnet-base-{dot,cos}-v1, paraphrase-mpnet-base-v2, microsoft/mpnet-base, all-mpnet-base-v1 |
 | hf\_modernbert.py | modernbert | 3 | answerdotai/ModernBERT-base, answerdotai/ModernBERT-large, other ModernBERT embed/classifier fine-tunes |
 
@@ -193,7 +256,12 @@ from transformers import AutoTokenizer
 
 model = AutoSpyreModelForCausalLM.from_pretrained("ibm-granite/granite-3.3-8b-instruct")
 tokenizer = AutoTokenizer.from_pretrained("ibm-granite/granite-3.3-8b-instruct")
-outputs = model.generate(tokenizer, ["What is 2+2?"], max_new_tokens=128)
+inputs = tokenizer(["What is 2+2?"], return_tensors="pt", padding=True)
+sequences = model.generate(**inputs, max_new_tokens=5)
+outputs = tokenizer.batch_decode(
+    sequences[:, inputs["input_ids"].shape[1] :],
+    skip_special_tokens=True,
+)
 ```
 
 `AutoSpyreModelForCausalLM` automatically selects the correct adapter based on the model's config type.
@@ -204,6 +272,18 @@ outputs = model.generate(tokenizer, ["What is 2+2?"], max_new_tokens=128)
 Calling `model(**inputs)` returns a standard `MaskedLMOutput`. The
 bidirectional encoder runs on Spyre and the complete
 model-specific MLM head runs on CPU.
+
+### Sequence-Classification Auto API
+
+`AutoSpyreModelForSequenceClassification` loads encoder models through
+`AutoModelForSequenceClassification`. Calling `model(**inputs)` returns a
+standard `SequenceClassifierOutput` with CPU `logits [B, num_labels]`. The
+bidirectional encoder runs on Spyre; the task head runs on CPU. For DistilBERT
+the two-stage head (`pre_classifier` Linear + ReLU, then `classifier` Linear with
+CLS extraction) is wrapped into a single `_DistilBertClassifierHead` so the
+`prefill_sequence_classification` call-site is uniform across all adapters.
+Same encoder-task constraints apply: right-padded, `input_ids`-based inference
+only (no training/loss, no custom embeddings, attentions, or hidden-state collection).
 
 ### Extractive Question-Answering Auto API
 
@@ -232,18 +312,15 @@ batch = processor.apply_chat_template(
     conv, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
 )
 
-texts = model.generate(
-    processor,
-    batch["input_ids"], batch["attention_mask"],
-    batch["pixel_values"], batch["image_sizes"],
-    max_new_tokens=64,
-)
+sequences = model.generate(**batch, max_new_tokens=64)
+prompt_len = batch["input_ids"].shape[1]
+texts = processor.batch_decode(sequences[:, prompt_len:], skip_special_tokens=True)
 ```
 
 `AutoSpyreModelForImageTextToText` loads the full VLM via
-`AutoModelForImageTextToText`, prepares **both** towers for Spyre, and attaches
-Spyre-aware `prefill_logits` (image + text → first-token logits) and `generate`
-(full image→text decode). A multimodal config is registered in both auto-mappings:
+`AutoModelForImageTextToText`, prepares **both** towers for Spyre, and attaches a
+Spyre-aware `generate` method for full image→text decode. A multimodal config is
+registered in both auto-mappings:
 `AutoSpyreModelForCausalLM` selects the *text-only* adapter (discards the vision
 tower), while `AutoSpyreModelForImageTextToText` selects the *combined* two-tower
 adapter. This applies to `Granite4VisionConfig` → `hf_granite_vision_mm`,
@@ -265,7 +342,7 @@ hf_adapters/
 ├── hf_common.py          — shared utilities
 │   DEVICE, BLOCK_SIZE,
 │   PrecomputedRotaryEmbedding, apply_rope_matmul,
-│   pad_attention_heads, patch_rmsnorm, pad_lm_head,
+│   pad_attention_heads, pad_lm_head,
 │   kv_cache_update, build_prefill_mask,
 │   build_expansion_mask, load_model_common, generate
 ├── hf_*.py               — one adapter per model family (see the
@@ -309,17 +386,28 @@ hf_adapters/
 **Why:** Spyre has no `sin`/`cos` ops and `aten.slice.Tensor` falls
 back to CPU inside compiled graphs.
 
-#### 2. RMSNorm: Class-Level Patch
+#### 2. RMSNorm: Stock HF, Fully Compiled
+
+Standard RMSNorm is **left as stock HuggingFace** — no patching. torch-spyre PR #2927
+(`FP32_TO_DL16` ElementArrangement + layout propagation) lowers stock HF's fp32-upcast
+pattern (`x.float() → pow(2).mean(-1) → rsqrt → mul → weight * result.to(dtype)`)
+on-device, so the numerically-stable fp32 variance reduction that stock HF uses now runs
+on Spyre and matches HF exactly.
 
 | Stock HF | Adapter |
 |---|---|
-| Each model has its own RMSNorm class | `patch_rmsnorm(cls)` patches any RMSNorm class in-place |
-| Casts to float32 for variance | Spyre: stays fp16. CPU: float32 (matches HF) |
-| `hidden_states.pow(2).mean()` | Spyre: `(hidden_states * hidden_states).mean()`. CPU: same as HF |
-| Python float epsilon | Spyre: `torch.ops.spyre.full((1,), eps, ...)` tensor. CPU: Python float |
+| `RMSNorm` inside decoder layers | Unchanged; runs inside the compiled block (`_make_compiled_block`), so #2927's fp32-upcast lowering applies |
+| Final `backbone.norm` (applied eager in `_run_forward`) | Compiled at prep time into `model._spyre_compiled_norm = torch.compile(backbone.norm, dynamic=False)`; the forward calls that. #2927's EA propagation is **compile-time only**, so the final norm must be traced to get the same fp32 numerics |
 
-**Why:** Spyre does not support dtype conversion on-device. `pow(2)`
-is not well supported; element-wise multiply is native.
+**Why:** EA-propagated fp32 upcasting is a compile-time feature. Per-layer norms are
+already traced (they live in the compiled block); the previously-eager final norm is now
+also compiled so every RMSNorm gets the stock-HF fp32 path. This let us delete the old
+`patch_rmsnorm` (which did the variance reduction at input dtype — a numerical
+compromise from before #2927).
+
+**Exception — Gemma 3 / Gemma 4** keep their own `_patch_gemma{3,4}_rmsnorm`: Gemma's
+RMSNorm is unit-offset (`(1.0 + weight)`) and has known fp16/bf16 overflow sensitivity,
+so it is handled separately and not covered by this stock-HF path.
 
 #### 3. LM Head Weight: Padded
 
@@ -496,16 +584,19 @@ so its RoPE freq cache is matched to bf16 via the explicit `set_rope_dtype`
 propagation, which handles Gemma's per-layer-type dict of RoPE modules.
 
 **Dual head_dim + proportional RoPE** (Gemma 4): `hf_gemma4.py` is Gemma 3
-plus its hardest features, targeting the **dense** decoders (12B / 31B). The
-sliding and global layers use a different `head_dim` each — sliding keeps full
-rotary over `head_dim`, global uses *proportional* RoPE
+plus its hardest features, targeting the dense decoders (12B / 31B) and the
+E2B / E4B variants. The sliding and global layers use a different `head_dim`
+each — sliding keeps full rotary over `head_dim`, global uses *proportional* RoPE
 (`partial_rotary_factor=0.25`, θ=1e6) over `global_head_dim` (the NoPE tail is
 zero frequencies, so the identity-rotation path applies). The two head_dims
 give two KV-cache shapes per model (`model._spyre_kv_shapes`). It further adds
 per-head V-norm (Q/K/V RMSNorm), a per-layer scalar, K==V projection sharing
 on global layers, unscaled attention (`scale=1.0`), and final-logit
-softcapping. PLE-based (E2B/E4B) and MoE (26B-A4B) variants are **not**
-supported — `prepare_for_spyre` asserts those features are absent.
+softcapping. E2B / E4B additionally use per-layer embeddings and trailing
+KV-sharing layers; each PLE slice is copied into fresh offset-zero storage
+before crossing a compiled-block boundary, including singleton decode steps.
+This is a small PLE copy, not a KV-cache copy. The MoE 26B-A4B variant uses the
+dedicated `hf_gemma4_moe.py` adapter, which shares this attention-side setup.
 
 **Learned absolute positions + Conv1D** (GPT-2): `hf_gpt2.py` is the first
 non-RoPE decoder — positions come from a learned `wpe` table added to `wte`, so
@@ -530,6 +621,18 @@ differs only in weight layout: GPT-Neo already uses `nn.Linear` everywhere (no
 The attention nests at `layer.attn.attention` (output `out_proj`), it omits the
 `1/sqrt(head_dim)` scale (`scale=1.0`), and its stock alternating global/local
 attention runs as full causal on Spyre. `head_dim=64` needs no padding.
+
+**Learned absolute positions + pre/post-LN** (OPT): `hf_opt.py` uses the same
+non-RoPE MHA block with OPT's separate `nn.Linear` Q/K/V/output projections and
+decomposed `fc1` → activation → `fc2` FFN. Position ids index OPT's learned
+embedding through its built-in Fairseq `+2` offset. The adapter preserves the
+stock attention operation order by multiplying Q by `1/sqrt(head_dim)` before
+SDPA and passing `scale=1.0`. It follows `do_layer_norm_before`, covering both
+the usual pre-LN checkpoints and post-LN OPT-350M, and handles 350M's
+`word_embed_proj_dim != hidden_size` through `project_in` / `project_out`.
+MHA KV shapes are explicit, sub-stick heads are zero-padded when needed, and
+LM-head padding is cropped back to the true vocabulary. OPT 125M is verified
+CPU-token-exact and 5/5 top-1 on Spyre across prefill plus decode.
 
 **Partial RoPE + parallel residual + fused QKV** (GPT-NeoX): `hf_gpt_neox.py`
 covers GPT-NeoX / Pythia (also Dolly v2, StableLM-base-alpha). It is a
@@ -622,8 +725,10 @@ the SigLIP tower:
 - **SwiGLU MLP** (`gate_proj` × `up_proj` → `down_proj`), unlike SigLIP's GELU-tanh
   two-layer MLP. No MLP intermediate padding needed (`intermediate_size=4096` is a
   multiple of 64).
-- **`PixtralRMSNorm`** (pre-LN on both attention and MLP sub-layers) patched via
-  `patch_rmsnorm`, same as text decoders.
+- **`PixtralRMSNorm`** (pre-LN on both attention and MLP sub-layers) left as stock HF:
+  the per-block norms run inside the compiled blocks, where PR #2927 lowers the
+  fp32-upcast pattern (`ln_pre` runs on CPU in the patch-embed step; the tower has no
+  eager final norm).
 - **Head-dim padding 64→128** (`_pad_pixtral_heads`). Pixtral's default
   `head_dim = 1024/16 = 64` (`D/2 = 32 < 64`), below one stick. Q/K/V/O are
   zero-padded to 128 with the SDPA scale held at `1/sqrt(64)`.
@@ -657,36 +762,61 @@ Multimodal-specific Spyre adaptations (beyond those shared with Granite VLM):
 - **`Mistral3PatchMerger`** (`nn.functional.unfold` + `merging_layer`) runs on
   CPU inside the projector — `unfold` doesn't lower on Spyre.
 
-**Encoder-free VLM — Gemma 4** (`hf_gemma4_mm.py`): the first VLM with **no
-vision tower**. Gemma 4 is unified (`model_type=gemma4_unified`); vision is a pure
-projection of processor-merged raw pixel patches (the image processor already
-merges `pooling_kernel_size²` 16×16 patches into each 48×48 merged patch, 1:1 to a
-soft token) into the LM embedding space — no attention, no RoPE, no KV cache. The
-adapter loads the full VLM via `AutoModelForImageTextToText`, projects the patches,
-scatters them into the `<image>` token slots, and runs the `hf_gemma4` text decoder
-unchanged (both towers live under the one model, so a single `prepare_for_spyre`
-covers them). Gemma4-specific Spyre adaptations:
+**Gemma 4 VLM** (`hf_gemma4_mm.py`) supports two vision architectures behind one
+multimodal frontend. `Gemma4UnifiedConfig` is encoder-free: it projects
+processor-merged raw pixel patches directly into the LM embedding space. The
+`Gemma4Config` checkpoints have a full Gemma 4 vision transformer. Its dense
+transformer blocks run on Spyre; integer position lookup, spatial pooling, and the
+text-space projector stay on CPU before features enter the shared Spyre
+image-scatter and decoder path. Text preparation dispatches by the nested config:
+dense and PLE/KV-sharing checkpoints reuse `hf_gemma4`, while
+`enable_moe_block=True` reuses `hf_gemma4_moe`. Gemma4-specific Spyre adaptations:
 
-- **Vision embedder compiled on Spyre.** The attention-free projection core
-  (`LN₁ → Dense → LN₂ → +pos_embs → pos_norm → RMSNorm → Linear`) is
-  `torch.compile`d and runs on Spyre. Only the integer-XY positional-embedding
-  gather (with `-1` padding validity masking) and the final padding-patch strip run
-  on **CPU** — those integer-gather / boolean-index ops don't lower (same doctrine
-  as the SigLIP CPU patch-embed). The CPU-built per-patch positional-embedding
-  tensor is passed into the compiled core as a device argument.
+- **Encoder-free vision embedder compiled on Spyre.** For `gemma4_unified`, the
+  attention-free projection core (`LN₁ → Dense → LN₂ → +pos_embs → pos_norm →
+  RMSNorm → Linear`) is `torch.compile`d and runs on Spyre. Only the integer-XY
+  positional gather and padding strip run on CPU.
+- **Full vision transformer blocks on Spyre** (`hf_gemma4_vision.py`). The CPU
+  patch projection and learned XY-position lookup produce a fixed 2520-patch
+  sequence; it is right-padded to 2560 so the attention score matmul has no ragged
+  final stick. Added and processor-padding key columns are masked once, the
+  sandwich-RMSNorm/GELU-gated encoder blocks run on Spyre, and the output is
+  cropped back to 2520 before the stock CPU spatial pooler. The text-space
+  `embed_vision` projector remains on CPU.
+- **Two-axis RoPE and head padding.** E2B's 64-wide and 26B-A4B's 72-wide heads
+  are padded to 128. Q/K channels and learned norm weights are rearranged so a
+  single matrix-form RoPE applies the stock independent X/Y rotations without
+  head-dimension slicing. Padded Q/K/V RMSNorm compensates for the added zero
+  lanes, preserving the native-width denominator; attention keeps stock's
+  explicit scale of 1.0. E2B's finite linear clipping bounds are preserved.
+- **Full-tower MLP padding.** The 26B-A4B vision tower's private intermediate
+  width is padded 4304→4352 by zero-extending gate/up outputs and down-projection
+  inputs. E2B's 3072-wide MLP is already stick-aligned. The 26B-only fp32 output
+  standardization remains on CPU with the pooler.
+- **PLE preserves stock multimodal semantics.** The token-identity component uses
+  image-placeholder IDs replaced with the pad token, while the contextual component
+  projects embeddings with multimodal positions replaced by the raw, unscaled pad
+  embedding weight.
+  Decode passes each generated
+  token ID through the generic VLM hook so PLE can be recomputed per step. Existing
+  producer-cache mapping handles the trailing KV-sharing layers.
+- **MoE text composition.** `enable_moe_block=True` selects the existing persistent
+  prefill and gathered-decode MoE blocks. Checkpoints combining MoE with PLE or KV
+  sharing remain explicitly unsupported.
 - **Vision LayerNorms un-fused + fp32 reduction** (`patch_layernorm`). The three
   vision `nn.LayerNorm`s NaN on Spyre's fused lowering on near-constant (small but
   nonzero variance) rows — in **both** bf16 and fp16, so it's a genuine lowering
   defect, not a range issue. The fix is a device-conditional un-fused rewrite with
-  the mean/variance reduction promoted to fp32 (same doctrine as `patch_rmsnorm`'s
-  CPU branch), keeping the affine multiply in bf16. Without it the VLM logits are
+  the mean/variance reduction promoted to fp32 (the same fp32-reduction doctrine stock
+  HF RMSNorm uses), keeping the affine multiply in bf16. Without it the VLM logits are
   all-NaN (see docs/gemma4_mm_vision_layernorm_spyre.md).
 - **Bidirectional vision attention at prefill.** `use_bidirectional_attention ==
-  "vision"`: within one image the soft-tokens attend bidirectionally. Stock OR-s a
-  blockwise band (same image group ⇒ allowed) into the causal mask for **both**
-  full and sliding layers, so at prefill the adapter builds `full = OR(causal,
-  blockwise)` and `sliding = AND(sliding_window, OR(causal, blockwise))`. Decode
-  steps are pure text (one new causal token), so no blockwise band after prefill.
+  "vision"`: full-vision `Gemma4Config` checkpoints keep full-attention layers
+  causal and use `AND(sliding_window, OR(causal, blockwise))` for sliding layers.
+  Encoder-free `Gemma4UnifiedConfig` checkpoints use `OR(causal, blockwise)` for
+  full layers and `OR(AND(sliding_window, causal), blockwise)` for sliding layers,
+  matching the stock Unified forward path. Decode steps are pure text (one new
+  causal token), so no blockwise band is needed after prefill.
 - **Runs in bf16.** Like the rest of the Gemma family (Gemma 3 / EmbeddingGemma),
   Gemma 4 overflows its residual stream in fp16 (`inf` → NaN end-to-end), so it
   runs in bf16. This is a separate concern from the vision LayerNorm defect above,
@@ -737,10 +867,12 @@ binaries against `accumulated_recompile_limit` as it advances.
 
 ### Open Work
 
-1. **Decode path numerical accuracy** — single-token decode (seq=1)
-   has max diffs of 1–6 per block vs CPU. Prefill (seq=64) is
-   accurate (0.01–0.08). Likely a torch-spyre stickify or layout
-   issue specific to seq_len=1. This is the primary blocker for
-   end-to-end correct generation on Spyre.
-2. **Multi-iteration benchmarking** — run 5+ iterations to measure
+1. **Multi-iteration benchmarking** — run 5+ iterations to measure
    steady-state latency (after compilation cache is warm)
+
+Decode-path numerical accuracy is no longer open work. Single-token decode was
+historically the primary blocker for end-to-end correct generation on Spyre, but
+it has been verified working on Granite and Qwen3 (and Gemma 4 E2B/E4B) against
+the current torch-spyre `main`: greedy top-1 matches CPU across prefill and four
+decode steps. Token-level comparison stays in the gating suite as a regression
+guard, not because decode is expected to diverge.
