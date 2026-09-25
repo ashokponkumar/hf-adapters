@@ -38,8 +38,8 @@ import re
 
 
 def _sanitize(text: str, max_len: int = 20) -> str:
-    """Strip chars not permitted in a PEP 440 local identifier; keep dots."""
-    return re.sub(r"[^a-zA-Z0-9.]", "", text)[:max_len]
+    """Map runs of chars not permitted in a PEP 440 local identifier to '.'."""
+    return re.sub(r"[^a-zA-Z0-9.]+", ".", text).strip(".")[:max_len].rstrip(".")
 
 
 def _get_build_number() -> str:
@@ -54,7 +54,7 @@ def _get_build_number() -> str:
 def _resolve_branch(version_branch: str | None) -> str:
     branch = (
         os.getenv("BRANCH_NAME")
-        or os.getenv("GIT_BRANCH", "").split("/")[-1]  # strips 'origin/' prefix
+        or os.getenv("GIT_BRANCH", "").removeprefix("origin/")
         or os.getenv("GITHUB_HEAD_REF")  # PR events (avoids NNN/merge from REF_NAME)
         or os.getenv("GITHUB_REF_NAME")  # push events
         or os.getenv("CI_COMMIT_REF_NAME")  # GitLab CI
