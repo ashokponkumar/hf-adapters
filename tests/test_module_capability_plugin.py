@@ -74,7 +74,7 @@ def test_properties(tmp_path):
     name = "test_eager_vs_compile_GptOssMLP_layer1_decode_spyre_bfloat16"
     props = dict(capability_properties(name, str(cfg), []))
     assert props == {
-        "capability.test_type": "module_ops",
+        "capability.test_type": "model_modules",
         "capability.subject": "gpt-oss-20b",
         "capability.name": "GptOssMLP_layer1_decode",
         "capability.sig.test": "test_eager_vs_compile",

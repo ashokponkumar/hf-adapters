@@ -71,7 +71,7 @@ def capability_properties(
         return []
     label, module, dtype = parts
     props = [
-        ("capability.test_type", "module_ops"),
+        ("capability.test_type", "model_modules"),
         ("capability.subject", subject_for(config_path)),
         ("capability.name", module),
         ("capability.sig.test", label),
