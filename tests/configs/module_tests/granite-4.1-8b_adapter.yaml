@@ -12,6 +12,7 @@ test_suite_config:
           mode: xfail
           tags:
             - model__granite-4.1-8b
+            - layout__device
           no_grad: true
           edits:
             modules:
@@ -447,6 +448,7 @@ test_suite_config:
           mode: xfail
           tags:
             - model__granite-4.1-8b
+            - layout__device
             - custom_tests
           no_grad: true
           edits:

@@ -2163,6 +2163,11 @@ def generate_unified_yaml_config(
     """
     # Build module entries
     module_entries = [_build_module_entry_dict(m) for m in captured_modules]
+    # Device-layout runs repeat entries of the plain config under the same model; the
+    # tag keeps their test ids apart.
+    tags = [f"model__{model_name}"]
+    if any(m.get("apply_device_layout") for m in captured_modules):
+        tags.append("layout__device")
 
     # Build the complete configuration dictionary
     config = {
@@ -2175,7 +2180,7 @@ def generate_unified_yaml_config(
                         {
                             "names": ["*TestModule*::test_forward"],
                             "mode": "xfail",
-                            "tags": [f"model__{model_name}"],
+                            "tags": tags,
                             # Spyre's custom ops have no registered autograd
                             # formula, so upstream's test_forward (which builds
                             # modules with ordinary requires_grad=True
@@ -2198,7 +2203,7 @@ def generate_unified_yaml_config(
                                 "*TestModuleCustom*::test_layout_stride",
                             ],
                             "mode": "xfail",
-                            "tags": [f"model__{model_name}", "custom_tests"],
+                            "tags": [*tags, "custom_tests"],
                             # Same AOTAutograd/no_grad issue as test_forward
                             # above: these custom tests also build modules
                             # with requires_grad=True parameters and compile
