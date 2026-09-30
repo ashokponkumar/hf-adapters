@@ -37,8 +37,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-# model_support scans HuggingFace Hub checkpoints, not a build of ours, so these rows join no
-# artifact -- unlike model_ops, whose subject IS something we built.
+# The subjects are Hub checkpoints, but the spyre verdicts depend on the image that ran them:
+# artifact_link.py ties each scan to it with one artifact_results leg.
 TEST_TYPE = "model_support"
 COMPONENT = "hf-adapters"
 
