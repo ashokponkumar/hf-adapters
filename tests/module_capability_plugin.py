@@ -100,7 +100,10 @@ def capability_properties(
         ("capability.name", module),
         ("capability.sig.test", label),
         ("capability.sig.dtype", dtype),
-        ("capability.sig.device_layout", str(bool(entry.get("apply_device_layout"))).lower()),
+        (
+            "capability.sig.device_layout",
+            str(bool(entry.get("apply_device_layout"))).lower(),
+        ),
         ("capability.backend", "cpu" if fallbacks else "spyre"),
     ]
     if entry.get("module_path"):

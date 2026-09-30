@@ -91,7 +91,9 @@ def test_properties(tmp_path):
         "capability.backend": "spyre",
         "capability.prop.module_path": "transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP",
     }
-    adapter = dict(capability_properties(name.replace("decode", "prefill"), str(cfg), []))
+    adapter = dict(
+        capability_properties(name.replace("decode", "prefill"), str(cfg), [])
+    )
     assert adapter["capability.sig.device_layout"] == "true"
     assert adapter["capability.prop.module_path"] == "hf_adapters.hf_gpt_oss.GptOssMLP"
     fb = dict(capability_properties(name, str(cfg), ["aten.x", "aten.x", "aten.y"]))
