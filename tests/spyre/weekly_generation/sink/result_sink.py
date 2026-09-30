@@ -51,6 +51,15 @@ class ResultSink(ABC):
     intermediate durability instead.
     """
 
+    @property
+    def v2_props(self) -> dict[str, dict[str, str]]:
+        """Per-model v2 run props the v1 row has no column for: the reuse key and marker.
+
+        Only the ClickHouse sink's v2 dual-write reads it; the CSV sink ignores it.
+        """
+        props: dict[str, dict[str, str]] = self.__dict__.setdefault("_v2_props", {})
+        return props
+
     @abstractmethod
     def _insert_entry(
         self,

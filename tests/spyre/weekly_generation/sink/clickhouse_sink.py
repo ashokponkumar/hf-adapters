@@ -165,6 +165,7 @@ class ClickHouseResultSink(ResultSink):
             capability_write.write(
                 capability_write.rows_from_pending(pending, TABLE_COLUMNS),
                 model_list_file=self._model_list_file,
+                extra_props=self.v2_props,
             )
         except Exception as exc:  # noqa: BLE001 - v2 must never fail the v1 write
             print(

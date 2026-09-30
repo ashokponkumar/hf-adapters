@@ -73,6 +73,7 @@ EXPAND_FIELDS: list[ExpandModelProperty_T] = [
     "library_name",
     "tags",
     "siblings",
+    "sha",
 ]
 
 # HF-API gateway 5xx statuses. Anything outside this set (400/401/403/404/...)

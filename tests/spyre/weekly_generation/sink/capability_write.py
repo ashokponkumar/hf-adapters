@@ -68,7 +68,10 @@ def _shard_of(model_list_file: str | None) -> str:
     return os.path.basename(str(model_list_file)).removesuffix(".json")
 
 
-def capability_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def capability_results(
+    rows: list[dict[str, Any]],
+    extra_props: dict[str, dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """One v2 result per (model, backend) from the v1 per-model rows.
 
     UNROLLS the tested ``verified_on_*`` booleans (see ``_BACKENDS``), which is a real
@@ -103,6 +106,9 @@ def capability_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
             if v not in (None, "")
         }
+        # Per-model run facts the v1 row has no column for: the reuse key, and on a
+        # carried-forward verdict the run that actually tested it.
+        props.update((extra_props or {}).get(model_name, {}))
         # adapter_name is the capability asked of the model, and is empty on a row that
         # failed before an adapter was ever selected (worker timeout/crash). Fall back to a
         # literal so the identity is still derivable -- capabilities.name is CHECKed non-empty,
@@ -124,7 +130,11 @@ def capability_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def write(rows: list[dict[str, Any]], model_list_file: str | None = None) -> int:
+def write(
+    rows: list[dict[str, Any]],
+    model_list_file: str | None = None,
+    extra_props: dict[str, dict[str, str]] | None = None,
+) -> int:
     """Dual-write the buffered v1 rows as v2 capability rows. Returns rows written.
 
     A no-op returning 0 when the v2 database is unset or its tables are absent, so a
@@ -168,7 +178,7 @@ def write(rows: list[dict[str, Any]], model_list_file: str | None = None) -> int
         )
         return 0
 
-    results = capability_results(rows)
+    results = capability_results(rows, extra_props)
     n = insert_capabilities(
         client, db, COMPONENT, run_id, TEST_TYPE, results, arch=ARCH, shard=shard
     )

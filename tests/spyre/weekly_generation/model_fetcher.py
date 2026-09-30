@@ -42,6 +42,11 @@ all_curated_loaders: dict[ModelType, Callable[..., list[str]]] = {
 monkeypatch it and exercise the pipeline without hitting the network."""
 
 
+def _hub_sha(model_info: object) -> str:
+    """The checkpoint's Hub commit, the model half of the weekly scan's reuse key."""
+    return str(getattr(model_info, "sha", None) or "")
+
+
 def fetch(model_type: ModelType, top_k: int) -> list[dict]:
     """Return the top *top_k* models of *model_type*, ordered by downloads.
 
@@ -63,7 +68,7 @@ def fetch(model_type: ModelType, top_k: int) -> list[dict]:
     # (which pickles them); both break on a ModelInfo.
     # we also indicate that the model is not a curated model
     for model in models:
-        model.pop("model_info", None)
+        model["hub_sha"] = _hub_sha(model.pop("model_info", None))
         model["curated"] = False
 
     print(f"{ts()} Fetched {len(models)} {model_type} model(s).")
@@ -103,7 +108,7 @@ def load_curated(model_type: ModelType) -> list[dict]:
     # Same contract as fetch(): drop the non-serializable ModelInfo, and mark
     # these rows as curated so the sink can record where they came from.
     for model in models:
-        model.pop("model_info", None)
+        model["hub_sha"] = _hub_sha(model.pop("model_info", None))
         model["curated"] = True
 
     print(f"{ts()} Fetched metadata for {len(models)} curated {model_type} model(s).")

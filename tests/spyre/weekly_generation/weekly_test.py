@@ -67,6 +67,7 @@ import time
 from datetime import date
 from pathlib import Path
 
+from tests.spyre.weekly_generation import reuse
 from tests.spyre.weekly_generation.failure_categories import (
     FAILURE_CATEGORY_HARDWARE_EXCEPTION,
     FAILURE_CATEGORY_WORKER_CRASHED,
@@ -438,6 +439,20 @@ def main(
                 f"{ts()} Skipping {before - len(rows)} model(s) already recorded "
                 f"for {snapshot_date} ({len(rows)} remaining)."
             )
+
+        if write_to_csv is None and reuse.enabled(snapshot_date):
+            rows, carried = reuse.split(
+                rows, reuse.lookup([str(r["model_id"]) for r in rows])
+            )
+            for row, prior in carried:
+                reuse.record(sink, row, prior, snapshot_date)
+            sink.flush()
+            print(
+                f"{ts()} Reused {len(carried)} unchanged verdict(s) for stack "
+                f"{reuse.stack_key()} ({len(rows)} left to test)."
+            )
+        for row in rows:
+            sink.v2_props[str(row["model_id"])] = reuse.run_props(row)
 
         total = len(rows)
         print(f"{ts()} Will evaluate {total} model(s).")

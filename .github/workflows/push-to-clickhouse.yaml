@@ -69,6 +69,13 @@ on:
           - dev
           - prod
         default: dev
+      force_retest:
+        description: >-
+          Re-test every model instead of carrying forward verdicts whose checkpoint and
+          stack are unchanged.
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Scoped per-ref: a new commit on a given branch cancels and supersedes
@@ -501,6 +508,17 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_HF_ADAPTERS_DIR"
+          # The stack half of the reuse key (see weekly_generation/reuse.py): a verdict is
+          # carried forward only while none of these, nor the checkpoint, has changed.
+          WEEKLY_STACK_KEY="$( {
+            echo "torch-spyre ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}"
+            git rev-parse HEAD:hf_adapters
+            rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort
+            uv pip freeze | grep -viE '^-e |hf.adapters|spyre.clickhouse.ingest'
+          } | sha256sum | cut -c1-16)"
+          export WEEKLY_STACK_KEY
+          export WEEKLY_REUSE="${{ inputs.force_retest && '0' || '1' }}"
+          echo "reuse stack key: ${WEEKLY_STACK_KEY} (reuse=${WEEKLY_REUSE})"
           uv run python tests/spyre/weekly_generation/weekly_test.py \
             --mode ${{ matrix.mode }} \
             --model-list-file shards/${{ matrix.shard_file }} \
@@ -614,6 +632,17 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_HF_ADAPTERS_DIR"
+          # The stack half of the reuse key (see weekly_generation/reuse.py): a verdict is
+          # carried forward only while none of these, nor the checkpoint, has changed.
+          WEEKLY_STACK_KEY="$( {
+            echo "torch-spyre ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}"
+            git rev-parse HEAD:hf_adapters
+            rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort
+            uv pip freeze | grep -viE '^-e |hf.adapters|spyre.clickhouse.ingest'
+          } | sha256sum | cut -c1-16)"
+          export WEEKLY_STACK_KEY
+          export WEEKLY_REUSE="${{ inputs.force_retest && '0' || '1' }}"
+          echo "reuse stack key: ${WEEKLY_STACK_KEY} (reuse=${WEEKLY_REUSE})"
           uv run python tests/spyre/weekly_generation/weekly_test.py \
             --mode ${{ matrix.mode }} \
             --model-list-file shards/${{ matrix.shard_file }} \
@@ -727,6 +756,17 @@ jobs:
           source "$HOME/.bashrc"
           source /etc/profile.d/ibm-aiu-setup.sh
           cd "$CLONED_HF_ADAPTERS_DIR"
+          # The stack half of the reuse key (see weekly_generation/reuse.py): a verdict is
+          # carried forward only while none of these, nor the checkpoint, has changed.
+          WEEKLY_STACK_KEY="$( {
+            echo "torch-spyre ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}"
+            git rev-parse HEAD:hf_adapters
+            rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' 2>/dev/null | sort
+            uv pip freeze | grep -viE '^-e |hf.adapters|spyre.clickhouse.ingest'
+          } | sha256sum | cut -c1-16)"
+          export WEEKLY_STACK_KEY
+          export WEEKLY_REUSE="${{ inputs.force_retest && '0' || '1' }}"
+          echo "reuse stack key: ${WEEKLY_STACK_KEY} (reuse=${WEEKLY_REUSE})"
           uv run python tests/spyre/weekly_generation/weekly_test.py \
             --mode ${{ matrix.mode }} \
             --model-list-file shards/${{ matrix.shard_file }} \
