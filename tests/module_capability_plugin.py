@@ -29,6 +29,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+import yaml
 
 _TEST_FILE = re.compile(r"(^|/)test_modules(_custom)?(__oot_wrapper)?\.py$")
 _TEST_NAME = re.compile(
@@ -55,6 +56,26 @@ def subject_for(config_path: str) -> str:
     return models.pop() if len(models) == 1 else Path(config_path).stem
 
 
+@functools.lru_cache(maxsize=None)
+def module_entries(config_path: str) -> dict[str, dict]:
+    """The config's module entries (those with a ``module_path``) by name."""
+    try:
+        doc = yaml.safe_load(Path(config_path).read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    found: dict[str, dict] = {}
+    todo = [doc]
+    while todo:
+        node = todo.pop()
+        if isinstance(node, dict):
+            if "name" in node and "module_path" in node:
+                found[str(node["name"])] = node
+            todo.extend(node.values())
+        elif isinstance(node, list):
+            todo.extend(node)
+    return found
+
+
 def fallback_op(message: str) -> str:
     m = re.match(r"\s*(aten\.\S+)", message)
     if m:
@@ -70,15 +91,20 @@ def capability_properties(
     if not parts or not config_path:
         return []
     label, module, dtype = parts
+    entry = module_entries(config_path).get(module, {})
+    # A module is run with plain or device-layout parameters (the adapter path); the
+    # _adapter configs repeat base entries under the latter, so it is part of the identity.
     props = [
         ("capability.test_type", "model_modules"),
         ("capability.subject", subject_for(config_path)),
         ("capability.name", module),
         ("capability.sig.test", label),
         ("capability.sig.dtype", dtype),
-        ("capability.sig.config", Path(config_path).stem),
+        ("capability.sig.device_layout", str(bool(entry.get("apply_device_layout"))).lower()),
         ("capability.backend", "cpu" if fallbacks else "spyre"),
     ]
+    if entry.get("module_path"):
+        props.append(("capability.prop.module_path", str(entry["module_path"])))
     if fallbacks:
         props.append(
             ("capability.prop.fallback_ops", json.dumps(list(dict.fromkeys(fallbacks))))

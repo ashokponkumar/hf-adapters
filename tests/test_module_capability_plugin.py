@@ -70,7 +70,15 @@ def test_fallback_op():
 
 def test_properties(tmp_path):
     cfg = tmp_path / "gpt-oss-20b.yaml"
-    cfg.write_text("tags: [model__gpt-oss-20b]\n")
+    cfg.write_text(
+        "tags: [model__gpt-oss-20b]\n"
+        "include:\n"
+        "  - name: GptOssMLP_layer1_decode\n"
+        "    module_path: transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP\n"
+        "  - name: GptOssMLP_layer1_prefill\n"
+        "    module_path: hf_adapters.hf_gpt_oss.GptOssMLP\n"
+        "    apply_device_layout: true\n"
+    )
     name = "test_eager_vs_compile_GptOssMLP_layer1_decode_spyre_bfloat16"
     props = dict(capability_properties(name, str(cfg), []))
     assert props == {
@@ -79,9 +87,13 @@ def test_properties(tmp_path):
         "capability.name": "GptOssMLP_layer1_decode",
         "capability.sig.test": "test_eager_vs_compile",
         "capability.sig.dtype": "torch.bfloat16",
-        "capability.sig.config": "gpt-oss-20b",
+        "capability.sig.device_layout": "false",
         "capability.backend": "spyre",
+        "capability.prop.module_path": "transformers.models.gpt_oss.modeling_gpt_oss.GptOssMLP",
     }
+    adapter = dict(capability_properties(name.replace("decode", "prefill"), str(cfg), []))
+    assert adapter["capability.sig.device_layout"] == "true"
+    assert adapter["capability.prop.module_path"] == "hf_adapters.hf_gpt_oss.GptOssMLP"
     fb = dict(capability_properties(name, str(cfg), ["aten.x", "aten.x", "aten.y"]))
     assert fb["capability.backend"] == "cpu"
     assert fb["capability.prop.fallback_ops"] == '["aten.x", "aten.y"]'
