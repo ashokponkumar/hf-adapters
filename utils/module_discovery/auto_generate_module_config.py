@@ -2711,13 +2711,14 @@ def generate_spyre_module_config(
         module_data["apply_device_layout"] = True
 
     # Both loaders capture same-named modules for one model; without this tag the
-    # <model>.yaml and <model>_adapter.yaml cases would share one case identity.
+    # <model>.yaml and <model>_adapter.yaml cases would share one case identity. It
+    # names the device layout, as capability.sig.device_layout does for verdicts.
     return write_module_config(
         capture,
         model_path,
         output,
         filename_suffix="_adapter",
-        extra_tags=("loader__spyre",),
+        extra_tags=("layout__device",),
     )
 
 
