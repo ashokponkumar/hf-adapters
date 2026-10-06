@@ -441,11 +441,12 @@ jobs:
           echo "| ${{ matrix.mode }} shard ${{ matrix.shard_index }} | ${ACTUAL} |" >> "$GITHUB_STEP_SUMMARY"
 
       # Must come AFTER build-hf-adapters: its `uv sync --frozen` prunes anything not in the
-      # lock, so installing before it would have this removed again.
+      # lock, so installing before it would have this removed again. --python: the job's
+      # VIRTUAL_ENV is the image's prebaked venv, not the project .venv that `uv run` uses.
       - name: Install the shared ClickHouse ingest library
         run: |
           cd "$CLONED_HF_ADAPTERS_DIR"
-          uv pip install "${CH_INGEST_LIB}"
+          uv pip install --python .venv/bin/python "${CH_INGEST_LIB}"
 
       - name: Download shard
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -554,11 +555,12 @@ jobs:
           echo "| ${{ matrix.mode }} shard ${{ matrix.shard_index }} | ${ACTUAL} |" >> "$GITHUB_STEP_SUMMARY"
 
       # Must come AFTER build-hf-adapters: its `uv sync --frozen` prunes anything not in the
-      # lock, so installing before it would have this removed again.
+      # lock, so installing before it would have this removed again. --python: the job's
+      # VIRTUAL_ENV is the image's prebaked venv, not the project .venv that `uv run` uses.
       - name: Install the shared ClickHouse ingest library
         run: |
           cd "$CLONED_HF_ADAPTERS_DIR"
-          uv pip install "${CH_INGEST_LIB}"
+          uv pip install --python .venv/bin/python "${CH_INGEST_LIB}"
 
       - name: Download shard
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -667,11 +669,12 @@ jobs:
           echo "| ${{ matrix.mode }} shard ${{ matrix.shard_index }} | ${ACTUAL} |" >> "$GITHUB_STEP_SUMMARY"
 
       # Must come AFTER build-hf-adapters: its `uv sync --frozen` prunes anything not in the
-      # lock, so installing before it would have this removed again.
+      # lock, so installing before it would have this removed again. --python: the job's
+      # VIRTUAL_ENV is the image's prebaked venv, not the project .venv that `uv run` uses.
       - name: Install the shared ClickHouse ingest library
         run: |
           cd "$CLONED_HF_ADAPTERS_DIR"
-          uv pip install "${CH_INGEST_LIB}"
+          uv pip install --python .venv/bin/python "${CH_INGEST_LIB}"
 
       - name: Download shard
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
