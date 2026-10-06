@@ -15,9 +15,9 @@ inputs:
   helper_url:
     description: >-
       torch-spyre's mark_retried.py. Stdlib-only, so it is fetched and run by path rather than
-      installed; pinned because it rewrites the report.
+      installed; @main, like the ingest that reads its marks.
     required: false
-    default: https://raw.githubusercontent.com/torch-spyre/torch-spyre/7670d690e80a786ad7218fcf5d4abf7a2963406c/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
+    default: https://raw.githubusercontent.com/torch-spyre/torch-spyre/main/extensions/clickhouse-ingest/spyre_clickhouse_ingest/mark_retried.py
 
 runs:
   using: composite
