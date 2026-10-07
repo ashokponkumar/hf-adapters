@@ -24,7 +24,7 @@ from tests.spyre.weekly_generation.sink.capability_write import (
 def link(client, db: str, record: str, env: dict[str, str]) -> bool:
     """Write the scan's leg; returns whether a row was written."""
     from spyre_clickhouse_ingest import (
-        ensure_artifact,
+        ensure,
         insert_artifact_result,
         run_id_of,
     )
@@ -37,7 +37,7 @@ def link(client, db: str, record: str, env: dict[str, str]) -> bool:
     server = env.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
     run_url = f"{server}/{repo}/actions/runs/{gha_run_id}" if repo else ""
     try:
-        artifact_id = ensure_artifact(
+        artifact_id = ensure(
             client,
             db,
             f"gha:{record}",

@@ -47,7 +47,7 @@ def written(monkeypatch) -> dict[str, list[dict[str, Any]]]:
         calls["result"].append({"db": db, **kw})
         return True
 
-    lib.ensure_artifact = ensure  # type: ignore[attr-defined]
+    lib.ensure = ensure  # type: ignore[attr-defined]
     lib.insert_artifact_result = insert  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "spyre_clickhouse_ingest", lib)
     return calls
