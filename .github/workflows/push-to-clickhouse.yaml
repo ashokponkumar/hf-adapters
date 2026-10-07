@@ -742,7 +742,7 @@ jobs:
   link-artifact:
     name: Link verdicts to the scanned image
     needs: [resolve-torch-spyre, weekly-model-scan-x1, weekly-model-scan-x2, weekly-model-scan-x4]
-    if: ${{ always() && needs.resolve-torch-spyre.result == 'success' }}
+    if: ${{ !cancelled() && needs.resolve-torch-spyre.result == 'success' }}
     continue-on-error: true
     runs-on: [x86_64, spyre_pf_x0, linux, image_torch_spyre]
     timeout-minutes: 15
