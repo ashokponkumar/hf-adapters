@@ -21,21 +21,33 @@ from tests.spyre.weekly_generation.sink.capability_write import (
 )
 
 
-def parse_record(raw: str) -> tuple[str, str, str]:
-    """derive-gha-artifact-id's ``<artifact_id>|<base_artifact_id>|<installed>`` record."""
-    parts = [f.strip() for f in (raw or "").split("|")]
-    parts += [""] * (3 - len(parts))
-    return parts[0], parts[1], parts[2]
-
-
 def link(client, db: str, record: str, env: dict[str, str]) -> bool:
     """Write the scan's leg; returns whether a row was written."""
-    from spyre_clickhouse_ingest import insert_gha_artifact_result, run_id_of
+    from spyre_clickhouse_ingest import (
+        ensure_artifact,
+        insert_artifact_result,
+        run_id_of,
+    )
 
-    artifact_id, base_id, installed = parse_record(record)
     gha_run_id = env.get("GITHUB_RUN_ID", "")
-    if not (artifact_id and gha_run_id):
+    if not (record and gha_run_id):
         print("  v2: no artifact id or GITHUB_RUN_ID -- no artifact leg written.")
+        return False
+    repo = env.get("GITHUB_REPOSITORY", "")
+    server = env.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    run_url = f"{server}/{repo}/actions/runs/{gha_run_id}" if repo else ""
+    try:
+        artifact_id = ensure_artifact(
+            client,
+            db,
+            f"gha:{record}",
+            ARCH,
+            component=COMPONENT,
+            run_url=run_url,
+            sources=[(repo, env.get("GITHUB_REF_NAME", ""), env.get("GITHUB_SHA", ""))],
+        ).artifact_id
+    except ValueError as err:
+        print(f"  v2: {err} -- no artifact leg written.")
         return False
     run_id = run_id_of("gha", gha_run_id, ARCH, TEST_TYPE)
     verdicts = client.query(
@@ -43,26 +55,18 @@ def link(client, db: str, record: str, env: dict[str, str]) -> bool:
         "WHERE run_id = {run_id:UUID} AND component = {c:String} AND test_type = {t:String}",
         parameters={"db": db, "run_id": run_id, "c": COMPONENT, "t": TEST_TYPE},
     ).result_rows[0][0]
-    repo = env.get("GITHUB_REPOSITORY", "")
-    server = env.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
-    wrote = insert_gha_artifact_result(
+    wrote = insert_artifact_result(
         client,
         db,
         artifact_id=artifact_id,
-        component=COMPONENT,
-        arch=ARCH,
         run_id=run_id,
         test_type=TEST_TYPE,
         # A survey, not a gate: most Hub models are expected to fail, so any verdict at all
         # is a completed scan. 'error' marks a scan that recorded nothing.
         state="passed" if verdicts else "error",
+        arch=ARCH,
         result_kind="capability",
-        base_artifact_id=base_id,
-        installed=installed,
-        repo=repo,
-        git_ref=env.get("GITHUB_REF_NAME", ""),
-        git_sha=env.get("GITHUB_SHA", ""),
-        run_url=f"{server}/{repo}/actions/runs/{gha_run_id}" if repo else "",
+        props={"run_url": run_url, "source": "gha"},
         attempt=int(env.get("GITHUB_RUN_ATTEMPT", "0") or 0),
     )
     print(
