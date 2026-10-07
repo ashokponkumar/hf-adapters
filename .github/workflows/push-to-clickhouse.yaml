@@ -116,6 +116,13 @@ env:
   # insert. Unset is a no-op, not a failure: v1 is what this scan exists to produce, so a
   # deployment without v2 tables writes v1 exactly as before. v1 and v2 never share a database.
   CLICKHOUSE_DB_V2: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_DB_V2_DEV || secrets.CLICKHOUSE_DB_V2 }}
+  # v2's own connection; empty falls back to the shared CLICKHOUSE_* above. Never crosses
+  # instances: an unset prod secret stays empty instead of reading the _DEV one.
+  CLICKHOUSE_V2_HOST: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_HOST_DEV || !(github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_HOST || '' }}
+  CLICKHOUSE_V2_PORT: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_PORT_DEV || !(github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_PORT || '' }}
+  CLICKHOUSE_V2_USER: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_USER_DEV || !(github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_USER || '' }}
+  CLICKHOUSE_V2_PASS: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_PASS_DEV || !(github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_PASS || '' }}
+  CLICKHOUSE_V2_DB: ${{ (github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_DB_DEV || !(github.event_name == 'workflow_dispatch' && inputs.clickhouse_db == 'dev') && secrets.CLICKHOUSE_V2_DB || '' }}
 
   # The shared schema-v2 write path, installed per job rather than declared in pyproject.toml:
   # build-hf-adapters runs `uv sync --frozen`, which would both require a lock entry and pin the
@@ -786,9 +793,22 @@ jobs:
         if: steps.derive.outputs.artifact_id != ''
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
+      # A v2-only write: the v2 connection, else (fallback, remove once every repo has
+      # CLICKHOUSE_V2_*) the shared one.
       - name: Write the artifact leg
         if: steps.derive.outputs.artifact_id != ''
+        env:
+          CLICKHOUSE_HOST: ${{ env.CLICKHOUSE_V2_HOST || env.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ env.CLICKHOUSE_V2_HOST && env.CLICKHOUSE_V2_PORT || env.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ env.CLICKHOUSE_V2_HOST && env.CLICKHOUSE_V2_USER || env.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ env.CLICKHOUSE_V2_HOST && env.CLICKHOUSE_V2_PASS || env.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB: ${{ env.CLICKHOUSE_V2_HOST && env.CLICKHOUSE_V2_DB || env.CLICKHOUSE_DB }}
+          CLICKHOUSE_DB_V2: ${{ env.CLICKHOUSE_V2_HOST && env.CLICKHOUSE_V2_DB || env.CLICKHOUSE_DB_V2 }}
         run: |
+          if [ -z "${CLICKHOUSE_V2_HOST}" ]; then
+            echo "::notice title=v2 ClickHouse::v2 written over the shared CLICKHOUSE_* secrets;" \
+                 "add CLICKHOUSE_V2_HOST/PORT/USER/PASS/DB to give v2 its own."
+          fi
           REC="$(tr -d '[:space:]' < artifact-id.txt)"
           uv run --no-project --with "${CH_INGEST_LIB}" \
             python -m tests.spyre.weekly_generation.sink.artifact_link --artifact-id "${REC}"
