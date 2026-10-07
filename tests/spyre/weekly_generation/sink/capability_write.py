@@ -144,7 +144,8 @@ def write(rows: list[dict[str, Any]], model_list_file: str | None = None) -> int
     )
     from spyre_clickhouse_ingest.schema import CAPABILITIES, CAPABILITY_RUNS
 
-    db = target_database()
+    v2_host = os.environ.get("CLICKHOUSE_V2_HOST", "")
+    db = os.environ.get("CLICKHOUSE_V2_DB", "") if v2_host else target_database()
     if not db:
         return 0
 
@@ -156,7 +157,20 @@ def write(rows: list[dict[str, Any]], model_list_file: str | None = None) -> int
     if not run_id:
         return 0
 
-    client = get_client()
+    if v2_host:
+        import clickhouse_connect
+
+        client = clickhouse_connect.get_client(
+            host=v2_host,
+            port=int(os.environ.get("CLICKHOUSE_V2_PORT") or 443),
+            user=os.environ.get("CLICKHOUSE_V2_USER") or "default",
+            password=os.environ.get("CLICKHOUSE_V2_PASS", ""),
+            database=db,
+            secure=True,
+        )
+    else:
+        # v2 over the v1 connection: remove once every repo has CLICKHOUSE_V2_*.
+        client = get_client()
     if not tables_present(client, db, (CAPABILITIES, CAPABILITY_RUNS)):
         print(f"  v2: {db} has no capability tables -- skipping v2 write.")
         return 0
