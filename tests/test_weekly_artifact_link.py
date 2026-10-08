@@ -20,13 +20,14 @@ ENV = {
 
 
 class _Client:
-    def __init__(self, verdicts: int):
-        self.verdicts = verdicts
+    def __init__(self, verdicts: int, legs: int = 0):
+        self.verdicts, self.legs = verdicts, legs
         self.queries: list[dict[str, Any]] = []
 
     def query(self, sql: str, parameters: dict[str, Any]):
         self.queries.append(parameters)
-        return types.SimpleNamespace(result_rows=[(self.verdicts,)])
+        n = self.legs if "artifact_results" in sql else self.verdicts
+        return types.SimpleNamespace(result_rows=[(n,)])
 
 
 @pytest.fixture
@@ -64,6 +65,7 @@ def test_the_leg_carries_the_record_and_the_scan_run(written):
         "hf-adapters",
     )
     assert art["sources"] == [("torch-spyre/hf-adapters", "main", "a" * 40)]
+    assert art["tags"] == [("hf-adapters@" + "a" * 12, "main")]
     (call,) = written["result"]
     assert call["artifact_id"] == "aid"
     # The run_id capability_write stamps on the verdicts, so the leg joins them.
@@ -96,4 +98,31 @@ def test_a_scan_with_no_verdicts_is_an_error_leg(written):
 )
 def test_nothing_is_written_without_an_artifact_or_a_run(written, record, env):
     assert not artifact_link.link(_Client(verdicts=5), "spyre_v2", record, env)
+    assert written == {"ensure": [], "result": []}
+
+
+def test_a_branch_dispatch_is_linked_untagged(written):
+    env = {**ENV, "GITHUB_REF_NAME": "fix/scan"}
+    assert artifact_link.link(_Client(verdicts=3), "spyre_v2", "aid|base|x", env)
+    assert written["ensure"][0]["tags"] == []
+
+
+def test_a_shard_links_once_it_has_verdicts(written):
+    assert artifact_link.link(
+        _Client(verdicts=7, legs=1), "spyre_v2", "aid|base|x", ENV, per_shard=True
+    )
+    assert written["result"][0]["state"] == "passed"
+
+
+def test_a_shard_with_nothing_flushed_leaves_it_to_the_final_job(written):
+    assert not artifact_link.link(
+        _Client(verdicts=0), "spyre_v2", "aid|base|x", ENV, per_shard=True
+    )
+    assert written == {"ensure": [], "result": []}
+
+
+def test_the_final_job_skips_a_scan_its_shards_linked(written):
+    assert not artifact_link.link(
+        _Client(verdicts=9, legs=2), "spyre_v2", "aid|base|x", ENV
+    )
     assert written == {"ensure": [], "result": []}
