@@ -315,7 +315,7 @@ jobs:
           sha: ${{ env.TRIGGERING_SHA }}
           run-id: ${{ steps.threaded-run-id.outputs.run_id }}
           gha-run-id: ${{ env.TRIGGERING_RUN_ID }}
-          artifact: ${{ steps.leg-artifact-id.outputs.value && format('gha:{0}', steps.leg-artifact-id.outputs.value) || '' }}
+          artifact-id: ${{ steps.leg-artifact-id.outputs.value }}
           repository: ${{ github.repository }}
           triggered-at: ${{ env.TRIGGERING_AT }}
           pr-number: ${{ steps.resolve-pr.outputs.pr_number }}
