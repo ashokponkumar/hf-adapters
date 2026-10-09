@@ -24,19 +24,25 @@ _BOOLS = ("verified_on_cpu", "verified_on_gpu", "verified_on_spyre", "curated")
 
 
 def read_rows(paths: list[Path]) -> list[dict[str, str | bool]]:
-    """The CSV rows, with the sink's ``True``/``False`` text back as booleans."""
+    """The CSV rows, with the sink's ``True``/``False`` text back as booleans, each carrying the
+    model type its file is named for (``csv_path_for``'s ``-<model_type>`` suffix)."""
     rows: list[dict[str, str | bool]] = []
     for path in paths:
+        model_type = path.stem.rsplit("-", 1)[-1]
         with open(path, newline="") as fh:
             for row in csv.DictReader(fh):
-                rows.append(
-                    {k: (v == "True") if k in _BOOLS else v for k, v in row.items()}
-                )
+                rec = {k: (v == "True") if k in _BOOLS else v for k, v in row.items()}
+                rows.append({**rec, "model_type": model_type})
     return rows
 
 
 def junit(rows: list[dict]) -> ET.ElementTree:
-    results = capability_results(rows)
+    # capability_results drops unknown columns, so the model type rides alongside each result.
+    results = [
+        {**res, "model_type": row["model_type"]}
+        for row in rows
+        for res in capability_results([row])
+    ]
     suite = ET.Element(
         "testsuite",
         name=TEST_TYPE,
@@ -57,7 +63,10 @@ def junit(rows: list[dict]) -> ET.ElementTree:
             ("subject", r["subject"]),
             ("name", r["name"]),
             ("backend", r["backend"]),
-        ] + [(f"prop.{k}", v) for k, v in r["props"].items()]
+        ] + [
+            (f"prop.{k}", v)
+            for k, v in {**r["props"], "model_type": r["model_type"]}.items()
+        ]
         for key, value in fields:
             ET.SubElement(props, "property", name=f"capability.{key}", value=str(value))
         if r["status"] == "failed":

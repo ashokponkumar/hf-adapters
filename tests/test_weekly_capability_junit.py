@@ -51,6 +51,7 @@ def test_one_case_per_backend_declaring_its_capability(tmp_path):
     )
     assert props["capability.backend"] == "spyre"
     assert props["capability.prop.parameters_number"] == "1000"
+    assert props["capability.prop.model_type"] == "generative"
     # The CSV's "False" text is a failed backend, not a truthy string.
     assert spyre.find("failure").get("message") == "spyre_compile"
     assert cpu.find("failure") is None
