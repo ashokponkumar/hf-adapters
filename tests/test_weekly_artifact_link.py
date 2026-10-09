@@ -126,3 +126,25 @@ def test_the_final_job_skips_a_scan_its_shards_linked(written):
         _Client(verdicts=9, legs=2), "spyre_v2", "aid|base|x", ENV
     )
     assert written == {"ensure": [], "result": []}
+
+
+def test_a_scheduled_scan_is_also_tagged_with_its_week(written, monkeypatch):
+    import datetime
+
+    class _Day(datetime.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 10, 10)
+
+    monkeypatch.setattr(artifact_link, "date", _Day)
+    env = {**ENV, "GITHUB_EVENT_NAME": "schedule"}
+    assert artifact_link.link(_Client(verdicts=3), "spyre_v2", "aid|base|x", env)
+    assert written["ensure"][0]["tags"] == [
+        ("hf-adapters@" + "a" * 12, "main"),
+        ("weekly-2026-w41", "weekly"),
+    ]
+    # A shard linking on Monday still names the scan's week.
+    env["SCAN_DATE"] = "2026-10-10"
+    monkeypatch.setattr(artifact_link, "date", datetime.date)
+    assert artifact_link.link(_Client(verdicts=3), "spyre_v2", "aid|base|x", env)
+    assert written["ensure"][1]["tags"][1] == ("weekly-2026-w41", "weekly")

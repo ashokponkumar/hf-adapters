@@ -1958,6 +1958,60 @@ jobs:
           job_key: model_module
           payload: '{"config": ${{ toJSON(matrix.config) }}, "shard": ${{ toJSON(matrix.shard) }}, "pytest_filter": ${{ toJSON(matrix.pytest_filter) }}}'
 
+  spyre-model-support-tests:
+    name: Spyre model-support scan
+    needs: [resolve-test-type, resolve-torch-spyre]
+    # Suite key "model_support" only (no tier includes it): a bounded Hub scan of the build
+    # under test, which the orchestrator's nightly/weekly dispatches. No pod-level retry: a
+    # survey's failing models are its verdicts, not flakes.
+    if: ${{ !cancelled() && (needs.resolve-torch-spyre.result == 'success' || needs.resolve-torch-spyre.result == 'skipped') && !inputs.skip_tests && !inputs.edge_cases_only && contains(format(' {0} ', needs.resolve-test-type.outputs.test_type), ' model_support ') }}
+    continue-on-error: true
+    runs-on:
+      - x86_64
+      - spyre_pf_x1
+      - linux
+      - ${{ inputs.image_label }}
+    timeout-minutes: 480
+    steps:
+      - name: Checkout composite actions
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/build-hf-adapters
+        id: build
+        with:
+          uv_groups: "dev spyre test models-ops"
+          ref: ${{ inputs.ref }}
+          repository: ${{ inputs.repository }}
+          torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
+          prebaked_image: ${{ inputs.prebaked_image }}
+
+      - name: Gather runner info
+        uses: ./.github/actions/gather-runner-info
+        with:
+          verbose: 'true'
+          runner_labels: ${{ format('["x86_64","spyre_pf_x1","linux","{0}"]', inputs.image_label) }}
+          pinned_torch_spyre_sha: ${{ needs.resolve-torch-spyre.outputs.torch_spyre_sha }}
+          hf_adapters_sha: ${{ steps.build.outputs.target_sha }}
+
+      - name: Run the model-support scan
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd "$CLONED_HF_ADAPTERS_DIR"
+          source .github/scripts/run-with-pod-stdout.sh
+          run_teed make model-support-tests RESULTS_DIR=model-support-results
+
+      - name: Upload JUnit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-model-support
+          path: ${{ env.CLONED_HF_ADAPTERS_DIR }}/model-support-results/junit-model-support/junit-model-support.xml
+          retention-days: 14
+
   # Pod-level retry (mirrors torch-spyre's _test_matrix.yaml): every spyre-*-tests job above is continue-on-error and uploads a "failed-suite-<key>-<attempt>-<idx>" descriptor artifact on a failed leg; this job downloads those descriptors and rebuilds one retry matrix per suite type for the *-retry jobs below to re-run on brand-new pods.
   collect-failed-suites:
     name: Collect suites for pod-level retry

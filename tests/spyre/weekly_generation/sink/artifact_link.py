@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import date
 
 from tests.spyre.weekly_generation.sink.capability_write import (
     ARCH,
@@ -60,8 +61,14 @@ def link(
         print(f"  v2: run_id={run_id} is already linked by its shards.")
         return False
     ref, sha = env.get("GITHUB_REF_NAME", ""), env.get("GITHUB_SHA", "")
-    # The main pin Jenkins gives an hf-adapters main build; a branch dispatch is untagged.
+    # The main pin Jenkins gives an hf-adapters main build, plus the week of a scheduled scan;
+    # a branch dispatch is untagged.
     tags = [(f"{COMPONENT}@{sha[:12]}", "main")] if ref == "main" and sha else []
+    if tags and env.get("GITHUB_EVENT_NAME") == "schedule":
+        # The scan's snapshot day, not the link's: shards finish days apart, across weeks.
+        day = env.get("SCAN_DATE", "")
+        year, week, _ = (date.fromisoformat(day) if day else date.today()).isocalendar()
+        tags.append((f"weekly-{year}-w{week:02}", "weekly"))
     try:
         artifact_id = ensure(
             client,

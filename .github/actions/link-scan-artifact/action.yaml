@@ -8,6 +8,9 @@ inputs:
   torch_spyre_sha:
     description: The torch-spyre revision the scan pinned (resolve-torch-spyre's output).
     required: true
+  scan_date:
+    description: The scan's snapshot date (generate-matrix's output), which dates its weekly tag.
+    required: true
 
 runs:
   using: composite
@@ -20,6 +23,7 @@ runs:
       env:
         TS_DIR: /home/senuser/torch-spyre
         TORCH_SPYRE_SHA: ${{ inputs.torch_spyre_sha }}
+        SCAN_DATE: ${{ inputs.scan_date }}
         REC_FILE: ${{ runner.temp }}/scan-artifact-id.txt
       run: |
         python3 "${TS_DIR}/.github/scripts/derive_artifact_id.py" \
