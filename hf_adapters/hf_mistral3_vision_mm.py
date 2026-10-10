@@ -69,6 +69,7 @@ import torch
 from hf_adapters import hf_pixtral_vision
 from hf_adapters.hf_common import (
     DEVICE,
+    embed_text_tokens,
     get_backbone,
     get_model_dtype,
     prepare_lm_head_for_spyre,
@@ -202,13 +203,6 @@ def _inject_image_features(hidden_states, features, vision_mask):
 # ---------------------------------------------------------------------------
 
 
-def _embed_text(model, input_ids):
-    """Token embeddings (Mistral has no embedding multiplier)."""
-    backbone = get_backbone(model)
-    ids = input_ids.to(backbone.embed_tokens.weight.device)
-    return backbone.embed_tokens(ids)
-
-
 def _run_text_backbone(
     model,
     inputs_embeds,
@@ -257,6 +251,8 @@ def _logits_from_embeds(
     image_features=None,
     vision_mask=None,
     input_ids=None,
+    *,
+    logits_to_keep=0,
 ):
     """Run text backbone over embeds + LM head → logits."""
     h = _run_text_backbone(
@@ -270,7 +266,7 @@ def _logits_from_embeds(
         image_features=image_features,
         vision_mask=vision_mask,
     )
-    return run_lm_head(model, h)
+    return run_lm_head(model, h, logits_to_keep=logits_to_keep)
 
 
 # ---------------------------------------------------------------------------
@@ -289,17 +285,19 @@ def _prefill_forward(
     cache_index,
     pixel_values,
     image_sizes,
+    logits_to_keep=0,
 ):
     """Shared multimodal prefill: padded ids + image → first-step logits.
 
     Builds scaled text embeddings, zeroes the ``<image>`` slots, runs the
     Pixtral tower + projector for image features, then runs the Mistral
-    decoder once with the features injected before layer 0.  Returns
-    full-sequence logits ``[B, padded_len, padded_vocab]``.
+    decoder once with the features injected before layer 0. By default, returns
+    full-sequence logits ``[B, padded_len, padded_vocab]``; generation passes
+    ``logits_to_keep=1`` to project only the final row.
     """
     model_dtype = get_model_dtype(model)
 
-    inputs_embeds = _embed_text(model, input_ids)
+    inputs_embeds = embed_text_tokens(model, input_ids)
     vision_mask = _vision_mask(model, input_ids)
     # Zero the <image> slots: multiply by a (0/1) keep factor built on CPU.
     # aten::masked_fill_ is not yet supported on Spyre (torch-spyre#1004);
@@ -319,4 +317,5 @@ def _prefill_forward(
         cache_index=cache_index,
         image_features=image_feats,  # on CPU; _inject_image_features moves to device
         vision_mask=vision_mask,  # CPU bool; _inject_image_features moves to device
+        logits_to_keep=logits_to_keep,
     )

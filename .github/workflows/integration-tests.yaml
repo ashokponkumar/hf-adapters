@@ -201,7 +201,7 @@ jobs:
         with:
           name: run-id
           path: run-id.txt
-          retention-days: 1
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Read tests/model_lists/integration.yaml and emit a space-separated model
@@ -257,6 +257,8 @@ jobs:
   run-tests:
     needs: [provenance, resolve-models]
     uses: ./.github/workflows/_test_matrix.yaml
+    # Reusable workflows get no secrets unless passed; without this HF_TOKEN resolves to "" in every test job.
+    secrets: inherit
     with:
       run_id: ${{ inputs.run_id }}
       image_label: ${{ inputs.runner_label || 'image_torch_spyre' }}

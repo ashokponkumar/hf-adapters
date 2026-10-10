@@ -23,6 +23,7 @@ compiled block functions.
 
 import math
 import os
+import sys
 import time
 import warnings
 from contextlib import contextmanager, nullcontext
@@ -177,6 +178,45 @@ def moe_decode_selected_experts(
         return expert_out.sum(dim=1)
 
 
+@contextmanager
+def named_moe_prefill_inputs(x, gate, up, down):
+    """Keep the prefill token work division attached to its eager inputs.
+
+    The expert loop's ``work_div={"T": 32}`` needs these names to resolve to
+    the token axis. Without them the compiler can leave most cores idle.
+    Accept flattened [T, H] or batched [B, T, H] inputs. Keep batch and sequence
+    names separate so flattening them for the expert loop and restoring the
+    batch shape both preserve dimension propagation.
+    """
+    if x.device.type != "spyre":
+        yield
+        return
+
+    named_dims = sys.modules["torch_spyre._inductor.wsr.propagate_named_dims"]
+    batch, tokens, _ = (1, *x.shape) if x.ndim == 2 else x.shape
+    input_names = ("T", "H") if x.ndim == 2 else ("B", "T", "H")
+    experts, hidden, intermediate = gate.shape
+    try:
+        for name, extent in (
+            ("B", batch),
+            ("E", experts),
+            ("T", tokens),
+            ("H", hidden),
+            ("M", intermediate),
+        ):
+            named_dims.declare_tensor_dim(name, extent)
+        named_dims.name_tensor_dims(
+            x, [name for name, size in zip(input_names, x.shape) if size != 1]
+        )
+        named_dims.name_tensor_dims(gate, ["E", "H", "M"])
+        named_dims.name_tensor_dims(up, ["E", "H", "M"])
+        named_dims.name_tensor_dims(down, ["E", "M", "H"])
+        yield
+    finally:
+        # Compilation consumes these globals; a cache hit does not.
+        named_dims.reset()
+
+
 def moe_prefill_all_experts(x, routing_weight, gate, up, down, activation):
     """Evaluate every expert and sum its routed prefill output."""
     if activation not in ("silu", "gelu_tanh"):
@@ -270,6 +310,28 @@ def assert_spyre_dimensions(config, model_name):
         )
 
 
+def to_default_device_layout(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Copy the embedding output into the default Spyre layout.
+
+    The embedding gives layer 0 its input in a different device layout than
+    the one each block gives the next layer. Dynamo checks the layout of
+    every block input, so layer 0 compiles its own copy of the block. One copy
+    into the default layout (the layout every block returns) lets all layers
+    use the same compiled block. If the layout is already the default, the
+    tensor does not change. Tensors that are not on Spyre are returned as is.
+    """
+    if hidden_states.device.type != "spyre":
+        return hidden_states
+    from torch_spyre._C import SpyreTensorLayout  # type: ignore[import-not-found]
+
+    target = SpyreTensorLayout(hidden_states.size(), hidden_states.dtype)
+    # ``device_layout=`` is added to Tensor.to by torch-spyre.
+    out: torch.Tensor = hidden_states.to(  # type: ignore[call-overload]
+        device_layout=target
+    )
+    return out
+
+
 def get_backbone(model):
     """Return the transformer backbone of an HF model or task wrapper object.
 
@@ -303,12 +365,26 @@ def get_backbone(model):
     return getattr(inner, "language_model", inner)
 
 
-def embed_text_tokens(model, input_ids):
-    """Embed text token ids using the model backbone's embedding policy."""
-    backbone = get_backbone(model)
+def embed_text_tokens(model, input_ids, backbone=None):
+    """Embed text token ids. All adapters use this for their token embedding.
+
+    Moves ``input_ids`` to the embedding's device, looks them up in
+    ``embed_tokens``, and multiplies by ``embedding_multiplier`` when the
+    backbone has one (Granite). Then copies the result into the default Spyre
+    layout (see ``to_default_device_layout``), so layer 0 gets its input in the
+    same layout as the other layers.
+
+    ``backbone`` defaults to ``get_backbone(model)``. Pass it for models that
+    keep ``embed_tokens`` somewhere else (OPT keeps it on ``decoder``).
+    """
+    if backbone is None:
+        backbone = get_backbone(model)
     input_ids = input_ids.to(backbone.embed_tokens.weight.device)
     hidden_states = backbone.embed_tokens(input_ids)
-    return hidden_states * getattr(backbone, "embedding_multiplier", 1.0)
+    multiplier = getattr(backbone, "embedding_multiplier", None)
+    if multiplier is not None:
+        hidden_states = hidden_states * multiplier
+    return to_default_device_layout(hidden_states)
 
 
 def text_config(config):
@@ -1213,11 +1289,13 @@ def prepare_lm_head_for_spyre(
     )
 
 
-def run_lm_head(model, hidden_states):
-    """Run the LM-head callable installed by :func:`prepare_lm_head_for_spyre`."""
+def run_lm_head(model, hidden_states, *, logits_to_keep: int = 0):
+    """Run the prepared head on the last requested rows (0 keeps every row)."""
     lm_head_forward = getattr(model, "_spyre_lm_head_forward", None)
     if lm_head_forward is None:
         raise RuntimeError("the model has not had an LM head prepared for Spyre")
+    if logits_to_keep:
+        hidden_states = hidden_states[:, -logits_to_keep:, :].contiguous()
     return lm_head_forward(hidden_states)
 
 
@@ -2554,6 +2632,7 @@ def generate(
     top_p=None,
     eos_token_id=_UNSET,
     timing=False,
+    prefill_backbone_fn: Optional[Callable] = None,
     prefill_fn: Optional[Callable] = None,
     decode_fn: Optional[Callable] = None,
     token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
@@ -2609,6 +2688,10 @@ def generate(
             generation config; pass ``None`` to disable EOS stopping (matches
             stock ``generate()``).
         timing: Print per-token latency.
+        prefill_backbone_fn: Optional adapter backbone with the same arguments
+            as ``run_forward_fn``, returning hidden states. Text prefill runs
+            this for every chunk, then applies the prepared LM head only to
+            the last token. Custom ``prefill_fn`` hooks take precedence.
         prefill_chunk_size (via generation_config or kwargs): Query length for
             each prefill chunk when the adapter does not configure one. An
             adapter-configured chunk size takes precedence; an explicit caller
@@ -2710,8 +2793,10 @@ def generate(
     min_new_tokens = cfg.min_new_tokens or 0
     begin_suppress_index = generation_begin_index(input_length, cfg.forced_bos_token_id)
 
-    if prefill_fn is None and run_forward_fn is None:
-        raise ValueError("run_forward_fn or prefill_fn must be provided")
+    if prefill_fn is None and prefill_backbone_fn is None and run_forward_fn is None:
+        raise ValueError(
+            "run_forward_fn, prefill_backbone_fn or prefill_fn must be provided"
+        )
     if decode_fn is None and run_forward_fn is None and effective_max_new_tokens > 1:
         raise ValueError("run_forward_fn or decode_fn must be provided")
 
@@ -2811,10 +2896,11 @@ def generate(
                     dtype=model_d_type,
                     device=DEVICE,
                 )
+                text_prefill_fn = prefill_backbone_fn or run_forward_fn
                 for chunk_start in range(0, padded_len, query_chunk_size):
                     chunk_end = chunk_start + query_chunk_size
                     prefill_mask = prefill_mask_builder.build(chunk_start)
-                    logits = run_forward_fn(  # type: ignore[misc]
+                    prefill_output = text_prefill_fn(  # type: ignore[misc]
                         model,
                         input_ids[:, chunk_start:chunk_end].to(DEVICE),
                         position_ids[:, chunk_start:chunk_end].to(DEVICE),
@@ -2825,6 +2911,13 @@ def generate(
                             chunk_start, query_chunk_size, DEVICE
                         ),
                     )
+                # Every chunk must populate KV, but only the final prompt
+                # token needs a vocabulary projection for generation.
+                logits = (
+                    run_lm_head(model, prefill_output, logits_to_keep=1)
+                    if prefill_backbone_fn is not None
+                    else prefill_output
+                )
             # Only the last chunk's final-token logits matter for next-token
             # selection. Slice on Spyre so the D2H copy transfers [B, V]
             # instead of the full [B, S, V] prefill output.
@@ -3231,8 +3324,7 @@ def standard_gqa_backbone_forward(
     Returns ``last_hidden_state`` (no ``lm_head``). Used directly by embedding
     callers; wrapped by ``standard_gqa_forward`` for causal-LM callers.
     """
-    backbone = get_backbone(model)
-    h = backbone.embed_tokens(input_ids)
+    h = embed_text_tokens(model, input_ids)
 
     selected_freqs = model._spyre_rope(h, position_ids)
 
@@ -3833,7 +3925,7 @@ def prefill_question_answering(
     attention_mask,
     token_type_ids=None,
 ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-    """Run an encoder on Spyre and its extractive-QA head on CPU."""
+    """Run an encoder and its extractive-QA head on Spyre."""
     last_hidden_state = prefill_encoder(
         run_encoder_forward_fn,
         model,
@@ -3865,7 +3957,7 @@ def prefill_sequence_classification(
     attention_mask,
     token_type_ids=None,
 ) -> torch.Tensor:
-    """Run an encoder on Spyre and its sequence-classification head on CPU."""
+    """Run an encoder and its sequence-classification head on Spyre."""
     last_hidden_state = prefill_encoder(
         run_encoder_forward_fn,
         model,
@@ -3892,15 +3984,12 @@ def prefill_token_classification(
     attention_mask,
     token_type_ids=None,
 ) -> torch.Tensor:
-    """Run an encoder on Spyre and its token-classification head on CPU.
+    """Run an encoder and its token-classification head on Spyre.
 
     Drives the encoder backbone via ``prefill_encoder``, then applies
     ``model.classifier`` (a single linear layer whose output dim equals
-    ``config.num_labels``) to every token position.  The head is kept on
-    CPU (via ``_spyre_cpu_submodules``) to avoid:
-
-    - ``aten.slice`` (index operations that don't lower on Spyre).
-    - Any Dropout path that uses ``torch.bernoulli``.
+    ``config.num_labels``) to every token position on device, so only the
+    ``[B, L, num_labels]`` logits are copied to CPU.
 
     Args:
         run_encoder_forward_fn: ``fn(model, input_ids, attn_mask, position_ids,
