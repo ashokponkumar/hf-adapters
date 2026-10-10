@@ -71,6 +71,7 @@ import torch
 from hf_adapters import hf_gemma4, hf_gemma4_moe, hf_gemma4_vision
 from hf_adapters.hf_common import (
     DEVICE,
+    embed_text_tokens,
     get_backbone,
     get_model_dtype,
     patch_layernorm,
@@ -278,8 +279,8 @@ def _embed_and_scatter(model, input_ids, image_features):
     input_ids_cpu = input_ids.to("cpu").clone()
     image_mask = input_ids_cpu == image_token_id  # [B, L] bool
     input_ids_cpu[image_mask] = text_config(model.config).pad_token_id
-    ids = input_ids_cpu.to(backbone.embed_tokens.weight.device)
-    h = backbone.embed_tokens(ids)  # scaled word embeddings, on embed device
+    # Scaled word embeddings, on the embedding's device.
+    h = embed_text_tokens(model, input_ids_cpu)
 
     n_image_tokens = int(image_mask.sum())
     hidden = h.shape[-1]
