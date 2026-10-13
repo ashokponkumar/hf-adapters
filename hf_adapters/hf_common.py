@@ -2636,6 +2636,7 @@ def generate(
     prefill_fn: Optional[Callable] = None,
     decode_fn: Optional[Callable] = None,
     token_aligned_inputs: Optional[dict[str, tuple[torch.Tensor, Any]]] = None,
+    streamer=None,
     **kwargs,
 ):
     """Model-agnostic generation: optional chunked prefill, then token decode.
@@ -2688,6 +2689,8 @@ def generate(
             generation config; pass ``None`` to disable EOS stopping (matches
             stock ``generate()``).
         timing: Print per-token latency.
+        streamer: Optional HF ``BaseStreamer`` (e.g. ``TextIteratorStreamer``);
+            receives the prompt, then each selected token. Batch size 1 only.
         prefill_backbone_fn: Optional adapter backbone with the same arguments
             as ``run_forward_fn``, returning hidden states. Text prefill runs
             this for every chunk, then applies the prepared LM head only to
@@ -2841,6 +2844,11 @@ def generate(
     # ``current_cache_len``, so generated tokens are contiguous from ``padded_len``.
     previous_tokens = None
     current_cache_len = padded_len
+
+    if streamer is not None:
+        if batch_size > 1:
+            raise ValueError("`streamer` supports batch size 1 only")
+        streamer.put(orig_input_ids.cpu())
 
     times_list = []
     finished = torch.zeros(batch_size, dtype=torch.bool)
@@ -3014,12 +3022,17 @@ def generate(
             next_tokens = next_tokens.masked_fill(finished, pad_token_id)
         generated_columns.append(next_tokens.clone())
         previous_tokens = next_tokens
+        if streamer is not None:
+            streamer.put(next_tokens.cpu())
 
         if eos_ids is not None:
             finished |= torch.isin(next_tokens, eos_ids)
 
         if finished.all():
             break
+
+    if streamer is not None:
+        streamer.end()
 
     if timing and times_list:
         print(f"\nFirst-token latency: {times_list[0] * 1000:.3f} ms")
