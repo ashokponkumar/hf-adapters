@@ -258,7 +258,9 @@ class CLIP:
         )
 
     def warmup(self):
-        self.embed(["warmup", Image.new("RGB", (224, 224))])
+        # A text-only model (any plain SentenceTransformer) raises on an image input.
+        self.images = "image" in getattr(self.st, "modalities", ["text", "image"])
+        self.embed(["warmup"] + ([Image.new("RGB", (224, 224))] if self.images else []))
 
     def embed(self, items):
         """Embeddings in input order; texts and images go in separate batches."""
@@ -283,6 +285,8 @@ class CLIP:
                     raise BadRequestError("input strings must be non-empty")
                 items.append(x)
             elif isinstance(x, dict) and x.get("type") == "image_url":
+                if not self.images:
+                    raise BadRequestError(f"{h.server.model_name} embeds text only")
                 items.append(decode_image(x))
             else:
                 raise BadRequestError(

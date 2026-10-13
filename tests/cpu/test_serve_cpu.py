@@ -86,6 +86,15 @@ class _ST:
         return {"attention_mask": torch.ones(len(texts), 4)}
 
 
+class _TextST(_ST):
+    modalities = ["text"]
+
+    def encode(self, items, convert_to_numpy):
+        if any(not isinstance(x, str) for x in items):
+            raise ValueError("Modality 'image' is not supported")
+        return super().encode(items, convert_to_numpy)
+
+
 def _vlm(monkeypatch):
     def init(self, model_path, trust_remote_code):
         self.dtype, self.model, self.processor = (
@@ -97,9 +106,9 @@ def _vlm(monkeypatch):
     monkeypatch.setattr(serve.VLM, "__init__", init)
 
 
-def _clip(monkeypatch):
+def _clip(monkeypatch, st=_ST):
     def init(self, model_path, trust_remote_code):
-        self.st = _ST()
+        self.st = st()
 
     monkeypatch.setattr(serve.CLIP, "__init__", init)
 
@@ -108,8 +117,11 @@ def _clip(monkeypatch):
 def start(monkeypatch):
     servers = []
 
-    def _start(task, load=True):
-        {"vlm": _vlm, "clip": _clip}[task](monkeypatch)
+    def _start(task, load=True, st=_ST):
+        if task == "clip":
+            _clip(monkeypatch, st)
+        else:
+            _vlm(monkeypatch)
         srv = serve.Server(("127.0.0.1", 0), task, "org/model", "m")
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(srv)
@@ -270,6 +282,15 @@ def test_embeddings_accept_a_single_string(start):
     status, _, text = _post(url + "/v1/embeddings", {"input": "hello"})
     assert status == 200
     assert len(json.loads(text)["data"]) == 1
+
+
+def test_text_only_embedder_loads_and_refuses_images(start):
+    _, url = start("clip", st=_TextST)
+    image = {"type": "image_url", "image_url": {"url": _data_url((7, 7))}}
+    assert _post(url + "/v1/embeddings", {"input": "hello"})[0] == 200
+    status, _, text = _post(url + "/v1/embeddings", {"input": ["hi", image]})
+    assert status == 400
+    assert "embeds text only" in json.loads(text)["error"]["message"]
 
 
 def test_yolo_reports_unsupported_build(monkeypatch):
