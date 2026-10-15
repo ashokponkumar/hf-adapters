@@ -19,7 +19,7 @@ from transformers import (
 from transformers.generation.streamers import BaseStreamer
 
 from hf_adapters import auto_spyre_model, hf_common
-from tests.model_registry import CAUSAL_LM_MODELS
+from tests.model_registry import CAUSAL_LM_MODELS, DRAFTER_KINDS
 
 
 @pytest.fixture(params=["granite", "llama", "gpt2", "opt", "gemma2"])
@@ -195,7 +195,7 @@ def test_custom_prefill_hook_takes_precedence(prepared_model):
         {
             info["adapter"].removesuffix(".py")
             for info in CAUSAL_LM_MODELS.values()
-            if info.get("kind") != "dspark_draft"
+            if info.get("kind") not in DRAFTER_KINDS
         }
     ),
 )
