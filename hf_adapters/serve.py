@@ -22,6 +22,10 @@ and ``GET /v1/models``, plus one task endpoint:
 - ``vlm``:  ``POST /v1/chat/completions`` with OpenAI content parts; images are
   ``image_url`` parts holding base64 ``data:`` URLs. Supports ``stream`` and
   ``stream_options.include_usage``.
+- ``chat``: ``POST /v1/chat/completions`` over a causal LM, text parts only; a
+  checkpoint without a chat template is sent the messages joined as a plain prompt.
+- ``rerank``: ``POST /v1/rerank`` ``{"query": ..., "documents": [...], "top_n": n}``
+  -> ``results`` of ``index``, ``document`` and ``relevance_score``, best first.
 - ``clip``: ``POST /v1/embeddings``; each ``input`` item is a string, a
   ``{"type": "text", "text": ...}`` part or an ``image_url`` part.
 - ``yolo``: ``POST /v1/segment`` ``{"image": "data:...", "conf": 0.25,
@@ -70,111 +74,42 @@ def decode_image(part):
         raise BadRequestError(f"cannot decode image: {e}") from e
 
 
-class VLM:
+def stream_generate(tokenizer, model, batch, gen, on_text):
+    """``model.generate(**batch)`` on a worker thread, calling ``on_text`` per decoded piece.
+
+    Returns ``(prompt_tokens, completion_tokens)``.
+    """
+    from transformers import TextIteratorStreamer
+
+    streamer = TextIteratorStreamer(
+        tokenizer, skip_prompt=True, skip_special_tokens=True
+    )
+    result = {}
+
+    def run():
+        try:
+            with torch.no_grad():
+                result["sequences"] = model.generate(**batch, streamer=streamer, **gen)
+        except BaseException as e:
+            result["error"] = e
+            streamer.end()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    for text in streamer:
+        if text:
+            on_text(text)
+    worker.join()
+    if "error" in result:
+        raise result["error"]
+    prompt_len = batch["input_ids"].shape[1]
+    return prompt_len, result["sequences"].shape[1] - prompt_len
+
+
+class Chat:
+    """``/v1/chat/completions`` over ``hf_messages`` and ``complete`` of the subclass."""
+
     path = "/v1/chat/completions"
-
-    def __init__(self, model_path, trust_remote_code):
-        from transformers import AutoProcessor
-
-        from hf_adapters import AutoSpyreModelForImageTextToText
-        from hf_adapters.auto_spyre_model import dtype_for_model_path
-
-        self.dtype = dtype_for_model_path(
-            model_path, target_device="spyre", trust_remote_code=trust_remote_code
-        )
-        self.model = AutoSpyreModelForImageTextToText.from_pretrained(
-            model_path, dtype=self.dtype, trust_remote_code=trust_remote_code
-        )
-        self.processor = AutoProcessor.from_pretrained(
-            model_path, trust_remote_code=trust_remote_code
-        )
-        self.processor.tokenizer.padding_side = "left"
-
-    def warmup(self):
-        self.complete(
-            [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": Image.new("RGB", (448, 448))},
-                        {"type": "text", "text": "Describe this image."},
-                    ],
-                }
-            ],
-            {"max_new_tokens": 2, "do_sample": False},
-            lambda _: None,
-        )
-
-    @staticmethod
-    def hf_messages(messages):
-        if not isinstance(messages, list) or not messages:
-            raise BadRequestError("messages is required")
-        out, images = [], 0
-        for m in messages:
-            content = m.get("content")
-            if isinstance(content, str):
-                content = [{"type": "text", "text": content}]
-            if not isinstance(content, list):
-                raise BadRequestError(
-                    "message content must be a string or a list of parts"
-                )
-            parts = []
-            for p in content:
-                kind = p.get("type")
-                if kind == "text":
-                    parts.append({"type": "text", "text": p.get("text", "")})
-                elif kind == "image_url":
-                    parts.append({"type": "image", "image": decode_image(p)})
-                    images += 1
-                else:
-                    raise BadRequestError(f"unsupported content part type {kind!r}")
-            out.append({"role": m.get("role", "user"), "content": parts})
-        # The Spyre VLM prefill always consumes image features.
-        if not images:
-            raise BadRequestError("this model needs at least one image_url part")
-        return out
-
-    def complete(self, conv, gen, on_text):
-        """Generate for ``conv``, calling ``on_text`` per decoded piece.
-
-        Returns ``(prompt_tokens, completion_tokens)``.
-        """
-        from transformers import TextIteratorStreamer
-
-        batch = self.processor.apply_chat_template(
-            conv,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
-        if "pixel_values" in batch:
-            batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
-        streamer = TextIteratorStreamer(
-            self.processor.tokenizer, skip_prompt=True, skip_special_tokens=True
-        )
-        result = {}
-
-        def run():
-            try:
-                with torch.no_grad():
-                    result["sequences"] = self.model.generate(
-                        **batch, streamer=streamer, **gen
-                    )
-            except BaseException as e:
-                result["error"] = e
-                streamer.end()
-
-        worker = threading.Thread(target=run, daemon=True)
-        worker.start()
-        for text in streamer:
-            if text:
-                on_text(text)
-        worker.join()
-        if "error" in result:
-            raise result["error"]
-        prompt_len = batch["input_ids"].shape[1]
-        return prompt_len, result["sequences"].shape[1] - prompt_len
 
     def handle(self, h, body):
         conv = self.hf_messages(body.get("messages"))
@@ -243,6 +178,228 @@ class VLM:
         if (body.get("stream_options") or {}).get("include_usage"):
             h.sse(chunk([], usage=usage))
         h.sse("[DONE]")
+
+
+class VLM(Chat):
+
+    def __init__(self, model_path, trust_remote_code):
+        from transformers import AutoProcessor
+
+        from hf_adapters import AutoSpyreModelForImageTextToText
+        from hf_adapters.auto_spyre_model import dtype_for_model_path
+
+        self.dtype = dtype_for_model_path(
+            model_path, target_device="spyre", trust_remote_code=trust_remote_code
+        )
+        self.model = AutoSpyreModelForImageTextToText.from_pretrained(
+            model_path, dtype=self.dtype, trust_remote_code=trust_remote_code
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+        self.processor.tokenizer.padding_side = "left"
+
+    def warmup(self):
+        self.complete(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": Image.new("RGB", (448, 448))},
+                        {"type": "text", "text": "Describe this image."},
+                    ],
+                }
+            ],
+            {"max_new_tokens": 2, "do_sample": False},
+            lambda _: None,
+        )
+
+    @staticmethod
+    def hf_messages(messages):
+        if not isinstance(messages, list) or not messages:
+            raise BadRequestError("messages is required")
+        out, images = [], 0
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            if not isinstance(content, list):
+                raise BadRequestError(
+                    "message content must be a string or a list of parts"
+                )
+            parts = []
+            for p in content:
+                kind = p.get("type")
+                if kind == "text":
+                    parts.append({"type": "text", "text": p.get("text", "")})
+                elif kind == "image_url":
+                    parts.append({"type": "image", "image": decode_image(p)})
+                    images += 1
+                else:
+                    raise BadRequestError(f"unsupported content part type {kind!r}")
+            out.append({"role": m.get("role", "user"), "content": parts})
+        # The Spyre VLM prefill always consumes image features.
+        if not images:
+            raise BadRequestError("this model needs at least one image_url part")
+        return out
+
+    def complete(self, conv, gen, on_text):
+        """Generate for ``conv``, calling ``on_text`` per decoded piece.
+
+        Returns ``(prompt_tokens, completion_tokens)``.
+        """
+        batch = self.processor.apply_chat_template(
+            conv,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        if "pixel_values" in batch:
+            batch["pixel_values"] = batch["pixel_values"].to(self.dtype)
+        return stream_generate(
+            self.processor.tokenizer, self.model, batch, gen, on_text
+        )
+
+
+class CausalLM(Chat):
+    """Text generation. A checkpoint without a chat template gets the conversation as a plain prompt."""
+
+    def __init__(self, model_path, trust_remote_code):
+        from transformers import AutoTokenizer
+
+        from hf_adapters import AutoSpyreModelForCausalLM
+        from hf_adapters.auto_spyre_model import dtype_for_model_path
+
+        self.model = AutoSpyreModelForCausalLM.from_pretrained(
+            model_path,
+            dtype=dtype_for_model_path(
+                model_path, target_device="spyre", trust_remote_code=trust_remote_code
+            ),
+            trust_remote_code=trust_remote_code,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+
+    def warmup(self):
+        self.complete(
+            [{"role": "user", "content": "Hello"}],
+            {"max_new_tokens": 2, "do_sample": False},
+            lambda _: None,
+        )
+
+    @staticmethod
+    def hf_messages(messages):
+        if not isinstance(messages, list) or not messages:
+            raise BadRequestError("messages is required")
+        out = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                if any(p.get("type") != "text" for p in content):
+                    raise BadRequestError("this model takes text content only")
+                content = "".join(p.get("text", "") for p in content)
+            if not isinstance(content, str):
+                raise BadRequestError(
+                    "message content must be a string or a list of text parts"
+                )
+            out.append({"role": m.get("role", "user"), "content": content})
+        return out
+
+    def encode(self, conv):
+        tok = self.tokenizer
+        if tok.chat_template:
+            return tok.apply_chat_template(
+                conv,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+        return tok("\n".join(m["content"] for m in conv), return_tensors="pt")
+
+    def complete(self, conv, gen, on_text):
+        batch = {
+            k: v
+            for k, v in self.encode(conv).items()
+            if k in ("input_ids", "attention_mask")
+        }
+        return stream_generate(self.tokenizer, self.model, batch, gen, on_text)
+
+
+class Rerank:
+    path = "/v1/rerank"
+    max_length = 512
+
+    def __init__(self, model_path, trust_remote_code):
+        from transformers import AutoTokenizer
+
+        from hf_adapters import AutoSpyreModelForSequenceClassification
+        from hf_adapters.auto_spyre_model import dtype_for_model_path
+
+        self.model = AutoSpyreModelForSequenceClassification.from_pretrained(
+            model_path,
+            dtype=dtype_for_model_path(
+                model_path, target_device="spyre", trust_remote_code=trust_remote_code
+            ),
+            trust_remote_code=trust_remote_code,
+        )
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+
+    def warmup(self):
+        self.score("warmup", ["warmup"])
+
+    def score(self, query, documents):
+        """``(relevance scores, token count)``; a single-logit head goes through a sigmoid, as in vLLM."""
+        encoded = self.tokenizer(
+            [query] * len(documents),
+            text_pair=documents,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            padding_side="right",
+        )
+        with torch.no_grad():
+            logits = self.model(**encoded, return_dict=True).logits.float()
+        scores = (
+            logits[:, 0].sigmoid()
+            if logits.shape[1] == 1
+            else logits.softmax(-1)[:, -1]
+        )
+        return scores.tolist(), int(encoded["attention_mask"].sum())
+
+    def handle(self, h, body):
+        query, docs = body.get("query"), body.get("documents")
+        if not isinstance(query, str) or not query.strip():
+            raise BadRequestError("query is required")
+        if (
+            not isinstance(docs, list)
+            or not docs
+            or not all(isinstance(d, str) and d.strip() for d in docs)
+        ):
+            raise BadRequestError("documents must be a non-empty list of strings")
+        scores, tokens = self.score(query, docs)
+        ranked = sorted(range(len(docs)), key=lambda i: -scores[i])
+        top = int(body.get("top_n") or len(docs))
+        h.send_json(
+            {
+                "id": f"rerank-{uuid.uuid4().hex}",
+                "model": h.server.model_name,
+                "usage": {"total_tokens": tokens},
+                "results": [
+                    {
+                        "index": i,
+                        "document": {"text": docs[i]},
+                        "relevance_score": scores[i],
+                    }
+                    for i in ranked[:top]
+                ],
+            }
+        )
 
 
 class CLIP:
@@ -402,7 +559,7 @@ class YOLO:
         )
 
 
-TASKS = {"vlm": VLM, "clip": CLIP, "yolo": YOLO}
+TASKS = {"vlm": VLM, "chat": CausalLM, "rerank": Rerank, "clip": CLIP, "yolo": YOLO}
 
 
 class Handler(BaseHTTPRequestHandler):

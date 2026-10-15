@@ -113,13 +113,77 @@ def _clip(monkeypatch, st=_ST):
     monkeypatch.setattr(serve.CLIP, "__init__", init)
 
 
+class _LMTokenizer(_Tokenizer):
+    def __init__(self, template):
+        self.chat_template = template
+        self.seen = []
+
+    def apply_chat_template(self, conv, **kwargs):
+        self.seen.append(("template", conv))
+        return {"input_ids": torch.ones(1, 4, dtype=torch.long), "extra": 1}
+
+    def __call__(self, text, return_tensors):
+        self.seen.append(("plain", text))
+        return {
+            "input_ids": torch.ones(1, 2, dtype=torch.long),
+            "attention_mask": torch.ones(1, 2, dtype=torch.long),
+        }
+
+
+class _LMModel(_VLMModel):
+    def generate(self, input_ids, streamer, attention_mask=None, **kwargs):
+        self.kwargs = kwargs
+        streamer.put(input_ids)
+        new = [ord(c) for c in self.reply][: kwargs["max_new_tokens"]]
+        for t in new:
+            streamer.put(torch.tensor([t]))
+        streamer.end()
+        return torch.cat([input_ids, torch.tensor([new])], dim=1)
+
+
+class _RerankTokenizer:
+    def __call__(self, queries, text_pair, **kwargs):
+        self.pairs = list(zip(queries, text_pair))
+        n = len(queries)
+        return {
+            "input_ids": torch.ones(n, 3, dtype=torch.long),
+            "attention_mask": torch.ones(n, 3, dtype=torch.long),
+        }
+
+
+class _RerankModel:
+    def __init__(self, logits):
+        self.logits = torch.tensor(logits)
+
+    def __call__(self, input_ids, attention_mask, return_dict):
+        return type("Out", (), {"logits": self.logits})()
+
+
+def _lm(monkeypatch, template="{{ messages }}"):
+    def init(self, model_path, trust_remote_code):
+        self.model, self.tokenizer = _LMModel(), _LMTokenizer(template)
+
+    monkeypatch.setattr(serve.CausalLM, "__init__", init)
+
+
+def _rerank(monkeypatch, logits=((0.0,), (2.0,), (-3.0,))):
+    def init(self, model_path, trust_remote_code):
+        self.model, self.tokenizer = _RerankModel(list(logits)), _RerankTokenizer()
+
+    monkeypatch.setattr(serve.Rerank, "__init__", init)
+
+
 @pytest.fixture
 def start(monkeypatch):
     servers = []
 
-    def _start(task, load=True, st=_ST):
+    def _start(task, load=True, st=_ST, template="{{ messages }}"):
         if task == "clip":
             _clip(monkeypatch, st)
+        elif task == "chat":
+            _lm(monkeypatch, template)
+        elif task == "rerank":
+            _rerank(monkeypatch)
         else:
             _vlm(monkeypatch)
         srv = serve.Server(("127.0.0.1", 0), task, "org/model", "m")
@@ -298,3 +362,75 @@ def test_yolo_reports_unsupported_build(monkeypatch):
     monkeypatch.setitem(sys.modules, "hf_adapters.ultralytics_yolo", None)
     with pytest.raises(SystemExit, match="unsupported in this build"):
         serve.YOLO("yolov8n-seg.pt", False)
+
+
+def _text_chat(text="Hi", **extra):
+    return {"model": "m", "messages": [{"role": "user", "content": text}], **extra}
+
+
+def test_causal_lm_chat_uses_the_chat_template(start):
+    srv, url = start("chat")
+    status, _, text = _post(url + "/v1/chat/completions", _text_chat(max_tokens=8))
+    assert status == 200
+    body = json.loads(text)
+    assert body["choices"][0]["message"]["content"] == "Hi!"
+    assert body["usage"] == {
+        "prompt_tokens": 4,
+        "completion_tokens": 3,
+        "total_tokens": 7,
+    }
+    assert srv.backend.tokenizer.seen[-1] == (
+        "template",
+        [{"role": "user", "content": "Hi"}],
+    )
+    assert srv.backend.model.kwargs["max_new_tokens"] == 8
+
+
+def test_causal_lm_without_a_chat_template_gets_a_plain_prompt(start):
+    srv, url = start("chat", template=None)
+    status, _, _ = _post(
+        url + "/v1/chat/completions",
+        {
+            "messages": [
+                {"role": "system", "content": "A"},
+                {"role": "user", "content": "B"},
+            ]
+        },
+    )
+    assert status == 200
+    assert srv.backend.tokenizer.seen[-1] == ("plain", "A\nB")
+
+
+def test_causal_lm_refuses_images(start):
+    _, url = start("chat")
+    status, _, text = _post(url + "/v1/chat/completions", _chat())
+    assert status == 400 and "text content only" in json.loads(text)["error"]["message"]
+
+
+def test_rerank_orders_by_relevance_and_keeps_the_input_index(start):
+    srv, url = start("rerank")
+    status, _, text = _post(
+        url + "/v1/rerank", {"query": "q", "documents": ["a", "b", "c"], "top_n": 2}
+    )
+    assert status == 200
+    results = json.loads(text)["results"]
+    assert [(r["index"], r["document"]["text"]) for r in results] == [
+        (1, "b"),
+        (0, "a"),
+    ]
+    assert results[0]["relevance_score"] == pytest.approx(0.8808, abs=1e-4)
+    assert srv.backend.tokenizer.pairs == [("q", "a"), ("q", "b"), ("q", "c")]
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        ({"documents": ["a"]}, "query is required"),
+        ({"query": "q", "documents": []}, "non-empty list"),
+        ({"query": "q", "documents": ["a", 1]}, "non-empty list"),
+    ],
+)
+def test_rerank_rejects_bad_requests(start, body, error):
+    _, url = start("rerank")
+    status, _, text = _post(url + "/v1/rerank", body)
+    assert status == 400 and error in json.loads(text)["error"]["message"]
