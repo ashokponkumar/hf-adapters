@@ -148,6 +148,7 @@ from hf_adapters import (
     hf_qwen3_5_moe,
     hf_smollm3,
     hf_xlm_roberta,
+    hf_xpress_qwen3,
 )
 from hf_adapters.hf_common import (
     SpyreNoAdapterError,
@@ -211,6 +212,8 @@ ARCH_TO_ADAPTER_MODULE_MAPPING: dict[str, ModuleType] = {
     "Qwen3DSparkModel": hf_dspark_qwen3,
     "Gemma4DSparkModel": hf_dspark_gemma4,
     "GraniteDSparkModel": hf_dspark_granite,
+    # XPress drafters (DFlash backbone + causal refiner) ship a plain Qwen3Config.
+    "Qwen3XPressModel": hf_xpress_qwen3,
     "ParamBharatGenForCausalLM": hf_bharatgen,
 }
 
@@ -255,6 +258,7 @@ class ModelDTypePolicy:
 
 
 MODEL_DTYPE_POLICIES: dict[str, ModelDTypePolicy] = {
+    "convaiinnovations/laya": ModelDTypePolicy(dtype=torch.float16),
     "google/embeddinggemma-300m": ModelDTypePolicy(dtype=torch.bfloat16),
     "ibm-granite/granite-4.0-1b-base": ModelDTypePolicy(cpu_dtype=torch.float32),
     "ibm-granite/granite-4.0-1b": ModelDTypePolicy(cpu_dtype=torch.float32),
